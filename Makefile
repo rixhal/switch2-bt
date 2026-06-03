@@ -1,15 +1,29 @@
-CC ?= aarch64-linux-gnu-gcc
-CFLAGS ?= -O2 -Wall
-PKG_CONFIG ?= pkg-config
-KERNELDIR ?= /tmp/linux-6.18.32
+CC ?= gcc
+CFLAGS ?= -O2 -s -Wall
+LDLIBS = -lbluetooth
 
-all: switch2-bt switch2-bt-ff.ko
+.PHONY: all clean aarch64
 
-switch2-bt: switch2-bt.c hid_report_descriptor.h
-	$(CC) $(CFLAGS) -o $@ switch2-bt.c $$($(PKG_CONFIG) --cflags --libs libsystemd)
+all: sw2d_final
 
-switch2-bt-ff.ko: switch2-bt-ff.c Kbuild
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_MODPOST_WARN=1 modules
+sw2d: sw2d.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+sw2d_final: sw2d_final.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+sw2d_lib: sw2d_lib.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+hciletest: hciletest.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+gattdump: gattdump.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+# Cross-compile for aarch64 (RPi5 / LibreELEC)
+aarch64:
+	aarch64-linux-gnu-gcc -O2 -s -Wall -o sw2d_final sw2d_final.c -lbluetooth
 
 clean:
-	rm -f switch2-bt *.o *.ko *.mod *.mod.c *.mod.o Module.symvers modules.order .*.cmd
+	rm -f sw2d sw2d_final sw2d_lib hciletest gattdump
