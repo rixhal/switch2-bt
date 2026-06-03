@@ -8,18 +8,46 @@
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 
-int main() {
+static int parse_type(const char *s, uint8_t *out)
+{
+    if (!s) return -1;
+    if (strcmp(s, "public") == 0) { *out = LE_PUBLIC_ADDRESS; return 0; }
+    if (strcmp(s, "random") == 0) { *out = LE_RANDOM_ADDRESS; return 0; }
+    return -1;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s BDADDR public|random\n", argv[0]);
+        fprintf(stderr, "  example: %s AA:BB:CC:DD:EE:FF random\n", argv[0]);
+        return 1;
+    }
+
+    const char *bdaddr_s = argv[1];
+    const char *type_s = argv[2];
+    uint8_t peer_type = LE_PUBLIC_ADDRESS;
+
+    if (parse_type(type_s, &peer_type) < 0) {
+        fprintf(stderr, "invalid type: %s (use public or random)\n", type_s);
+        return 1;
+    }
+
     int dd = hci_open_dev(0);
     if (dd < 0) { perror("hci_open_dev"); return 1; }
     printf("Opened hci0 (fd=%d)\n", dd);
     
     bdaddr_t peer;
-    str2ba("E0:EF:BF:3B:C6:76", &peer);
+    if (str2ba(bdaddr_s, &peer) < 0) {
+        fprintf(stderr, "invalid BDADDR: %s\n", bdaddr_s);
+        close(dd);
+        return 1;
+    }
     
-    printf("Creating LE connection to E0:EF:BF:3B:C6:76...\n");
+    printf("Creating LE connection to %s (type=%s)...\n",
+           bdaddr_s, type_s);
     uint16_t handle = 0;
     int rc = hci_le_create_conn(dd, 0x0004, 0x0004, 0x00,
-                                LE_PUBLIC_ADDRESS, peer, LE_PUBLIC_ADDRESS,
+                                peer_type, peer, LE_PUBLIC_ADDRESS,
                                 0x000F, 0x000F, 0x0000, 0x0C80, 0x0001, 0x0001,
                                 &handle, 6000);
     if (rc < 0) {
