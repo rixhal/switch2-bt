@@ -122,6 +122,28 @@ Offset  Size  Field
 | L2CAP sockets (`socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP)`) | Needs BlueZ connection management — same filter problem |
 | `hcitool lecc` as connection anchor | ACL data goes to hcitool's socket, not daemon's |
 
+### Phase 8: Peer Address Type Fix (Fixed)
+- Claude review identified `peer_bdaddr_type=public` mismatch with random-address controller
+- Added `--peer-addr-type public|random|auto`, `--auto-scan`, `--bdaddr` CLI flags
+- `scan_for_peer()` parses LE Advertising Report to detect actual address type
+- **Result:** Both `public` and `random` connect successfully (Handle 0x0040)
+- Controller address changes per power cycle: `68:47:2E:..`, `16:34:39:..`, `E0:EF:BF:..`
+
+### Phase 9: GATT Timeout Bug (Fixed)
+- `read_full()` in `hci_read_packet()` blocked forever on partial HCI events
+- Kernel delivered 8/62 bytes (plen=0x3E) — `read_full` hung waiting for remaining 54
+- **Fix:** Replace `read_full` with `poll()+read()`, accept partial reads
+- `read_acl_att()` added deadline-based total timeout (reset per-poll was infinite loop)
+- GATT probing now gracefully times out after 2s per request
+- **Result:** MTU exchange fails but daemon reconnects cleanly
+
+### Phase 10: Kernel mgmt Interference (Fixed)
+- **btmon discovery:** Kernel sends `LE Read Remote Used Features` (#5) simultaneously with daemon's ATT MTU request (#4), causing controller disconnect (0x3E)
+- **Root cause:** `hci_open_dev()` uses `HCI_CHANNEL_RAW` — kernel mgmt shares the connection
+- **Fix:** `hci_user_open()` with `HCI_CHANNEL_USER` (exclusive access) + `hci_le_create_conn_raw()` (manual LE Create Connection via `writev`)
+- **Remaining:** Controller still drops connection before ATT — needs protocol analysis
+- Reconnect loop: ✅ 1s → 2s → 4s → 8s backoff, handles disconnects gracefully
+
 ## Operational Notes
 
 - **bluetoothd must be stopped** before running the daemon. Raw HCI requires
