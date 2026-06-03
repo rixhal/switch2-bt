@@ -23,3 +23,7 @@ hcitest
 gattdump
 sw2rawd
 l2test_c
+# test binaries
+test_args
+test_bdaddr
+test_adv_parse
