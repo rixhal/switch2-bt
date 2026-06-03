@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libbluetooth-dev
+
+      - name: Build sw2d_final
+        run: make
+
+      - name: Build tools (sw2d_lib, hciletest)
+        run: make tools
+
+      - name: Build and run tests
+        run: make test

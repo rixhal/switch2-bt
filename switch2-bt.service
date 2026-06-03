@@ -1,13 +1,14 @@
 [Unit]
 Description=Switch 2 Pro Controller BLE-to-UHID Bridge
-After=bluetooth.service
-Wants=bluetooth.service
+Conflicts=bluetooth.service
+After=network-online.target
+Before=kodi.service
 
 [Service]
 Type=simple
-ExecStart=/storage/switch2-bt -a 00:00:00:00:00:00
+ExecStart=/storage/switch2-bt/sw2d_final --auto-scan --peer-addr-type auto --own-addr-type public
 Restart=always
-RestartSec=5
+RestartSec=2
 StandardOutput=journal
 StandardError=journal
 
