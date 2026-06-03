@@ -122,6 +122,15 @@ Offset  Size  Field
 | L2CAP sockets (`socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP)`) | Needs BlueZ connection management — same filter problem |
 | `hcitool lecc` as connection anchor | ACL data goes to hcitool's socket, not daemon's |
 
+## Operational Notes
+
+- **bluetoothd must be stopped** before running the daemon. Raw HCI requires
+  exclusive access to `hci0`. Run `systemctl stop bluetooth` first.
+- Controller BD_ADDR is **random per power cycle**. `E0:EF:BF:3B:C6:76` was the
+  address during development. The daemon accepts BD_ADDR as a CLI argument.
+- ADV_IND packets contain Nintendo Manufacturer Data (`0x0553`) and Flags `0x06`.
+  This was confirmed via `btmon` capture during Phase 4 testing.
+
 ## Build Environment
 
 ```
