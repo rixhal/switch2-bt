@@ -21,6 +21,21 @@
 #include <bluetooth/hci_lib.h>
 
 /* ── HCI / ATT constants ──────────────────────────────────────────────── */
+#ifndef HCI_CHANNEL_USER
+#define HCI_CHANNEL_USER 1
+#endif
+
+#ifndef EVT_CMD_COMPLETE
+#define EVT_CMD_COMPLETE  0x0e
+#endif
+#ifndef EVT_CMD_STATUS
+#define EVT_CMD_STATUS    0x0f
+#endif
+
+#ifndef OCF_LE_CREATE_CONN
+#define OCF_LE_CREATE_CONN 0x000d
+#endif
+
 #define HCI_COMMAND_PKT  0x01
 #define HCI_ACLDATA_PKT  0x02
 #define HCI_EVENT_PKT    0x04
@@ -378,7 +393,33 @@ scan_restore:
     return 0;
 }
 
-/* ── HCI filter (works on libbluetooth fd too) ──────────────────────── */
+/* ── HCI socket: exclusive user channel (blocks kernel mgmt) ────────────── */
+static int hci_user_open(void)
+{
+    int fd = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
+    if (fd < 0) {
+        perror("socket AF_BLUETOOTH/HCI");
+        return -1;
+    }
+
+    struct sockaddr_hci addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.hci_family = AF_BLUETOOTH;
+    addr.hci_dev = 0;
+    addr.hci_channel = HCI_CHANNEL_USER;  /* exclusive access */
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind hci0 HCI_CHANNEL_USER");
+        fprintf(stderr, "trying HCI_CHANNEL_RAW (mgmt may interfere)...\n");
+        addr.hci_channel = HCI_CHANNEL_RAW;
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("bind hci0 HCI_CHANNEL_RAW");
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
 static int set_acl_runtime_filter(int fd)
 {
     struct hci_filter nf;
@@ -456,38 +497,135 @@ static int hci_read_packet(int fd, uint8_t *buf, size_t bufsz, int timeout_ms)
 
     if (bufsz < 1)
         return -1;
-    if (read_full(fd, buf, 1) != 1) {
-        perror("read HCI packet type");
+    ssize_t n = read(fd, buf, 1);
+    if (n != 1) {
+        if (n < 0) perror("read HCI packet type");
         return -1;
     }
 
     if (buf[0] == HCI_EVENT_PKT) {
         if (bufsz < 3)
             return -1;
-        if (read_full(fd, buf + 1, 2) != 2)
+        /* Read event header: 2 bytes (code + plen) */
+        if (poll(&pfd, 1, timeout_ms) <= 0) return 0;
+        n = read(fd, buf + 1, 2);
+        if (n != 2) return -1;
+        uint8_t plen = buf[2];
+        if (3u + plen > bufsz)
             return -1;
-        if (3u + buf[2] > bufsz)
-            return -1;
-        if (read_full(fd, buf + 3, buf[2]) != buf[2])
-            return -1;
-        return 3 + buf[2];
+        /* Read what's available — don't block for full plen */
+        if (poll(&pfd, 1, timeout_ms) <= 0) return 0;
+        n = read(fd, buf + 3, plen);
+        if (n < 0) return -1;
+        if (n == 0) return 0;
+        return 3 + (int)n;
     }
 
     if (buf[0] == HCI_ACLDATA_PKT) {
         uint16_t dlen;
         if (bufsz < 5)
             return -1;
-        if (read_full(fd, buf + 1, 4) != 4)
+        /* Read ACL header: 4 bytes */
+        if (poll(&pfd, 1, timeout_ms) <= 0) return 0;
+        if (read(fd, buf + 1, 4) != 4)
             return -1;
         dlen = get_le16(buf + 3);
         if (5u + dlen > bufsz)
             return -1;
-        if (read_full(fd, buf + 5, dlen) != dlen)
-            return -1;
-        return 5 + dlen;
+        /* Read ACL data */
+        if (poll(&pfd, 1, timeout_ms) <= 0) return 0;
+        n = read(fd, buf + 5, dlen);
+        if (n < 0) return -1;
+        if (n == 0) return 0;
+        return 5 + (int)n;
     }
 
     return 1;
+}
+
+/* ── Raw LE Create Connection (via HCI_CHANNEL_USER socket) ──────────── */
+static int hci_le_create_conn_raw(int dd,
+                                   uint16_t scan_interval,
+                                   uint16_t scan_window,
+                                   uint8_t peer_type,
+                                   const bdaddr_t *peer,
+                                   uint8_t own_type,
+                                   uint16_t interval_min,
+                                   uint16_t interval_max,
+                                   uint16_t latency,
+                                   uint16_t supervision_timeout,
+                                   uint16_t min_ce_length,
+                                   uint16_t max_ce_length,
+                                   int timeout_ms)
+{
+    uint8_t params[25];
+    int max_iter = timeout_ms / 100;
+    if (max_iter < 1) max_iter = 1;
+
+    /* Build LE Create Connection command parameters (25 bytes) */
+    put_le16(params + 0, scan_interval);
+    put_le16(params + 2, scan_window);
+    params[4] = 0;  /* initiator_filter */
+    params[5] = peer_type;
+    memcpy(params + 6, peer, 6);
+    params[12] = own_type;
+    put_le16(params + 13, interval_min);
+    put_le16(params + 15, interval_max);
+    put_le16(params + 17, latency);
+    put_le16(params + 19, supervision_timeout);
+    put_le16(params + 21, min_ce_length);
+    put_le16(params + 23, max_ce_length);
+
+    if (raw_hci_send_cmd(dd, OGF_LE_CTL, OCF_LE_CREATE_CONN, params, 25) < 0) {
+        fprintf(stderr, "LE Create Connection: send failed\n");
+        return -1;
+    }
+
+    for (int i = 0; i < max_iter; i++) {
+        uint8_t buf[256];
+        int n = hci_read_packet(dd, buf, sizeof(buf), 100);
+        if (n <= 0)
+            continue;
+
+        if (buf[0] != HCI_EVENT_PKT || n < 3)
+            continue;
+
+        uint8_t evt = buf[1];
+        uint8_t plen = buf[2];
+        const uint8_t *ev = buf + 3;
+
+        if (evt == EVT_CMD_STATUS && plen >= 4) {
+            uint8_t status = ev[0];
+            uint16_t opcode = get_le16(ev + 1);
+            uint16_t expected = (uint16_t)((OCF_LE_CREATE_CONN & 0x03ff) | (OGF_LE_CTL << 10));
+            if (opcode != expected)
+                continue;
+            if (status != 0) {
+                fprintf(stderr, "LE Create Connection: CMD_STATUS error 0x%02x\n", status);
+                return -1;
+            }
+            /* Status 0 = pending — continue waiting for connection complete */
+            continue;
+        }
+
+        if (evt == EVT_LE_META && plen >= 1 && ev[0] == EVT_LE_CONN_COMPLETE) {
+            if (plen < 19) {
+                fprintf(stderr, "LE Connection Complete: short event (%u bytes)\n", plen);
+                continue;
+            }
+            uint8_t status = ev[1];
+            uint16_t handle = get_le16(ev + 2);
+            if (status != 0) {
+                fprintf(stderr, "LE Connection Complete: status=0x%02x handle=0x%04x\n",
+                        status, handle);
+                return -1;
+            }
+            return (int)handle;
+        }
+    }
+
+    fprintf(stderr, "LE Create Connection: timeout after %dms\n", timeout_ms);
+    return -1;
 }
 
 /* ── ACL / ATT framing ──────────────────────────────────────────────── */
@@ -521,9 +659,17 @@ static int read_acl_att(int fd, uint16_t conn_handle, uint8_t *att,
                         size_t attsz, uint16_t *out_handle, int timeout_ms)
 {
     uint8_t pkt[2048];
+    int64_t deadline = (int64_t)time(NULL) * 1000 + timeout_ms;
 
     for (;;) {
-        int n = hci_read_packet(fd, pkt, sizeof(pkt), timeout_ms);
+        int64_t now = (int64_t)time(NULL) * 1000;
+        int remaining = (int)(deadline - now);
+        if (remaining <= 0) {
+            fprintf(stderr, "read_acl_att: total timeout %dms reached\n", timeout_ms);
+            return 0;
+        }
+        if (remaining > 1000) remaining = 1000; /* poll at most 1s at a time */
+        int n = hci_read_packet(fd, pkt, sizeof(pkt), remaining);
         if (n <= 0)
             return n;
 
@@ -601,6 +747,7 @@ static void gatt_probe(int fd, uint16_t handle)
     uint8_t mtu_req[3] = {ATT_EXCHANGE_MTU_REQ, 0x05, 0x02};
     int n = att_request_response(fd, handle, mtu_req, sizeof(mtu_req),
                                  rsp, sizeof(rsp), ATT_EXCHANGE_MTU_RSP, 2000);
+    fflush(stderr);
     if (n >= 3 && rsp[0] == ATT_EXCHANGE_MTU_RSP) {
         fprintf(stderr, "ATT MTU response: %u\n", get_le16(rsp + 1));
     } else {
@@ -879,8 +1026,8 @@ static int run_session(const bdaddr_t *peer, uint8_t peer_type, uint8_t own_type
     uint8_t att[1024];
     uint8_t hid[32];
 
-    /* 1. Open HCI device via libbluetooth */
-    dd = hci_open_dev(0);
+    /* 1. Open HCI device via exclusive user channel (blocks kernel mgmt) */
+    dd = hci_user_open();
     if (dd < 0) {
         perror("hci_open_dev");
         return -1;
@@ -889,12 +1036,12 @@ static int run_session(const bdaddr_t *peer, uint8_t peer_type, uint8_t own_type
     /* 2. LE Create Connection */
     fprintf(stderr, "creating LE connection to %s (peer_type=%s own_type=%s)...\n",
             peer_txt, addr_type_str(peer_type), addr_type_str(own_type));
-    int rc = hci_le_create_conn(dd,
+    {
+        int ret = hci_le_create_conn_raw(dd,
                                 0x0004,    /* scan_interval   */
                                 0x0004,    /* scan_window     */
-                                0,         /* initiator_filter */
                                 peer_type, /* peer_bdaddr_type */
-                                *peer,     /* peer BD_ADDR    */
+                                peer,      /* peer BD_ADDR    */
                                 own_type,  /* own_bdaddr_type */
                                 0x000F,    /* conn_interval_min (15 * 1.25ms = 18.75ms) */
                                 0x000F,    /* conn_interval_max */
@@ -902,12 +1049,13 @@ static int run_session(const bdaddr_t *peer, uint8_t peer_type, uint8_t own_type
                                 0x0C80,    /* supervision_timeout (3200 * 10ms) */
                                 0x0001,    /* min_ce_length   */
                                 0x0001,    /* max_ce_length   */
-                                &handle,
-                                25000);    /* timeout ms      */
-    if (rc < 0) {
-        fprintf(stderr, "hci_le_create_conn: %s (%d)\n", strerror(-rc), -rc);
-        close(dd);
-        return -1;
+                                6000);     /* timeout ms      */
+        if (ret < 0) {
+            fprintf(stderr, "hci_le_create_conn_raw: failed (%d)\n", ret);
+            close(dd);
+            return -1;
+        }
+        handle = (uint16_t)ret;
     }
     fprintf(stderr, "connected: handle=0x%04x\n", handle);
 
@@ -918,10 +1066,14 @@ static int run_session(const bdaddr_t *peer, uint8_t peer_type, uint8_t own_type
     }
 
     /* 4. Request faster connection update (7.5ms) */
-    hci_request_conn_update(dd, handle);
+    /* skip conn update for now — test if it corrupts fd state */
+    /* hci_request_conn_update(dd, handle); */
+    fprintf(stderr, "skipping conn update, entering GATT probe\n");
 
     /* 5. GATT service/characteristic discovery */
+    fflush(stderr);
     gatt_probe(dd, handle);
+    fflush(stderr);
 
     /* 6. Create UHID device */
     if (!no_uhid) {
