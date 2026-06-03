@@ -1,0 +1,15 @@
+[Unit]
+Description=Switch 2 Pro Controller BLE-to-UHID Bridge
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/storage/switch2-bt -a 00:00:00:00:00:00
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
