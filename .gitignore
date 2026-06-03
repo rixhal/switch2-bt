@@ -8,3 +8,18 @@ modules.order
 .*.cmd
 switch2-bt
 hid_desc.bin
+# compiled binaries
+sw2d
+sw2d_final
+sw2d_lib
+hciletest
+acltest
+hciraw
+hciraw2
+hciraw3
+hcisend
+hcisend2
+hcitest
+gattdump
+sw2rawd
+l2test_c
