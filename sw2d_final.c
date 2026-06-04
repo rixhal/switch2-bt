@@ -969,6 +969,155 @@ int main(int argc, char **argv) {
         /* ── ATT/GATT after encryption ─────────────────────────────── */
         fprintf(stderr, "=== ATT/GATT ===\n");
 
+        /* ATT MTU Exchange */
+        {
+            uint8_t mtu[] = {ATT_OP_MTU_REQ, 0xFF, 0x00};
+            if (att_send(cmd_fd, &s, mtu, sizeof(mtu)) < 0) goto reconnect;
+            fprintf(stderr, "  ATT MTU req sent\n");
+
+            int64_t dl = now_ms() + 2000;
+            int got_mtu = 0;
+            while (now_ms() < dl && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == ATT_CID && f.payload_len >= 3 && f.payload[0] == ATT_OP_MTU_RSP) {
+                    s.att_mtu = get_le16(f.payload+1);
+                    fprintf(stderr, "  ATT MTU: %u\n", s.att_mtu);
+                    got_mtu = 1; break;
+                }
+            }
+            if (!got_mtu) s.att_mtu = 23; /* default */
+            s.state = STATE_ATT_READY;
+        }
+
+        /* GATT: discover primary services */
+        uint16_t svc_start = 0, svc_end = 0;
+        {
+            uint8_t req[] = {ATT_OP_READ_BY_GROUP_REQ, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28};
+            if (att_send(cmd_fd, &s, req, sizeof(req)) < 0) goto reconnect;
+
+            int64_t dl = now_ms() + 3000;
+            while (now_ms() < dl && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == ATT_CID) {
+                    if (f.payload_len >= 3 && f.payload[0] == ATT_OP_READ_BY_GROUP_RSP) {
+                        int elen = f.payload[1];
+                        if (elen >= 6 && !svc_start) {
+                            svc_start = get_le16(f.payload+2);
+                            svc_end   = get_le16(f.payload+4);
+                            fprintf(stderr, "  Service: 0x%04x-0x%04x\n", svc_start, svc_end);
+                        }
+                        break;
+                    }
+                    if (f.payload_len >= 1 && f.payload[0] == ATT_OP_ERROR_RSP) {
+                        fprintf(stderr, "  GATT error on service discovery\n"); break;
+                    }
+                }
+            }
+            if (!svc_start) {
+                /* Fallback: use full range */
+                svc_start = 0x0001; svc_end = 0xFFFF;
+                fprintf(stderr, "  Using full range for char discovery\n");
+            }
+            s.svc_start = svc_start; s.svc_end = svc_end;
+        }
+
+        /* GATT: discover characteristics */
+        {
+            uint8_t req[] = {ATT_OP_READ_BY_TYPE_REQ,
+                             (uint8_t)(svc_start & 0xFF), (uint8_t)(svc_start >> 8),
+                             (uint8_t)(svc_end & 0xFF), (uint8_t)(svc_end >> 8),
+                             0x03, 0x28}; /* UUID for characteristic */
+            if (att_send(cmd_fd, &s, req, sizeof(req)) < 0) goto reconnect;
+
+            int64_t dl = now_ms() + 3000;
+            while (now_ms() < dl && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == ATT_CID && f.payload_len >= 1) {
+                    if (f.payload[0] == ATT_OP_READ_BY_TYPE_RSP) {
+                        int elen = f.payload[1];
+                        if (elen >= 7) {
+                            uint16_t val_handle = get_le16(f.payload+5);
+                            uint8_t  props      = f.payload[4];
+                            fprintf(stderr, "  Char: props=0x%02x value=0x%04x\n", props, val_handle);
+                            if (props & 0x10) { /* notify */
+                                s.report_handle = val_handle;
+                                s.report_cccd   = val_handle + 1;
+                                fprintf(stderr, "    -> INPUT (notify) handle=0x%04x cccd=0x%04x\n",
+                                        s.report_handle, s.report_cccd);
+                            }
+                        }
+                    }
+                    if (f.payload[0] == ATT_OP_ERROR_RSP) break;
+                }
+            }
+            if (!s.report_handle) {
+                fprintf(stderr, "  WARNING: no notify characteristic found\n");
+                s.report_handle = 0x000E; s.report_cccd = 0x000F;
+            }
+            s.state = STATE_GATT_READY;
+        }
+
+        /* Enable notifications (CCCD write) */
+        {
+            uint8_t req[] = {ATT_OP_WRITE_REQ,
+                             (uint8_t)(s.report_cccd & 0xFF), (uint8_t)(s.report_cccd >> 8),
+                             0x01, 0x00}; /* enable notification */
+            if (att_send(cmd_fd, &s, req, sizeof(req)) < 0) goto reconnect;
+
+            int64_t dl = now_ms() + 2000;
+            while (now_ms() < dl && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == ATT_CID && f.payload_len >= 1 && f.payload[0] == ATT_OP_WRITE_RSP) {
+                    fprintf(stderr, "  CCCD write OK — notifications enabled\n");
+                    break;
+                }
+            }
+            s.state = STATE_NOTIFICATIONS_ENABLED;
+        }
+
+        /* ── Input Report Loop ───────────────────────────────────────── */
+        fprintf(stderr, "=== Receiving input reports ===\n");
+        {
+            int count = 0;
+            while (g_running && s.state == STATE_NOTIFICATIONS_ENABLED) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 1000);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) {
+                    fprintf(stderr, "  Disconnected (%d reports)\n", count);
+                    break;
+                }
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == ATT_CID && f.payload_len >= 3 && f.payload[0] == ATT_OP_HANDLE_NOTIFY) {
+                    uint16_t vh = get_le16(f.payload+1);
+                    uint16_t vl = f.payload_len - 3;
+                    const uint8_t *vd = f.payload + 3;
+                    if (vh == s.report_handle && vl >= 1 && vd[0] == 0x09) {
+                        count++;
+                        fprintf(stderr, "REPORT #%d (%d bytes): ", count, vl);
+                        for (int i = 0; i < vl && i < 16; i++) fprintf(stderr, "%02x ", vd[i]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
+
     reconnect:
         if (!g_running) break;
         fprintf(stderr, "reconnecting in %ds...\n", backoff);
