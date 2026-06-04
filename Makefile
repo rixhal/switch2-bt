@@ -18,6 +18,11 @@ sw2d_lib: sw2d_lib.c
 hciletest: hciletest.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
+two_socket_test: two_socket_test.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+tools: sw2d_final sw2d_lib hciletest two_socket_test
+
 gattdump: gattdump.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
