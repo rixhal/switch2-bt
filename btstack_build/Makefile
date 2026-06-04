@@ -1,12 +1,12 @@
-# Makefile for sw2d_btstack — BTstack port/linux + Switch 2 app
+# Makefile for switch2_btstack_bridge — BTstack port/linux + Switch 2 GATT Bridge
 BTSTACK_ROOT ?= $(HOME)/btstack
 PROJECT_DIR  ?= $(HOME)/switch2-raw
-TARGET       = sw2d_btstack
+TARGET       = switch2_btstack_bridge
 
 # Framework
 CORE_SRC = \
 	$(BTSTACK_ROOT)/port/linux/main.c \
-	$(PROJECT_DIR)/sw2d_btstack.c \
+	$(PROJECT_DIR)/btstack-upstream/example/switch2_btstack_bridge.c \
 	$(BTSTACK_ROOT)/platform/posix/btstack_run_loop_posix.c \
 	$(BTSTACK_ROOT)/platform/posix/btstack_tlv_posix.c \
 	$(BTSTACK_ROOT)/platform/posix/hci_dump_posix_fs.c \
@@ -16,6 +16,7 @@ CORE_SRC = \
 	$(BTSTACK_ROOT)/src/ble/le_device_db_tlv.c \
 	$(BTSTACK_ROOT)/3rd-party/rijndael/rijndael.c \
 	$(BTSTACK_ROOT)/src/btstack_memory.c \
+	$(BTSTACK_ROOT)/src/btstack_link_key_db_tlv.c \
 	$(BTSTACK_ROOT)/src/btstack_linked_list.c \
 	$(BTSTACK_ROOT)/src/btstack_memory_pool.c \
 	$(BTSTACK_ROOT)/src/btstack_run_loop.c \
@@ -99,6 +100,9 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(PROJECT_DIR)/%.c
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
+
+switch2_btstack_bridge.o: $(PROJECT_DIR)/btstack-upstream/example/switch2_btstack_bridge.c
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 CFLAGS += -include $(BTSTACK_ROOT)/port/linux/btstack_config.h
