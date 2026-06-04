@@ -814,27 +814,160 @@ int main(int argc, char **argv) {
             fprintf(stderr, "SMP Pairing Request sent (IO=NoInputNoOutput, AuthReq=Bonding)\n");
         }
 
-        /* Wait for SMP Pairing Response */
+        /* Read SMP Pairing Response from ACL/SMP_CID */
         {
-            int rc = rx_await(&s, EVT_LE_META, 0, 5000);
-            if (rc == -2) { fprintf(stderr, "Disconnected during SMP\n"); goto reconnect; }
-            if (rc != 1) { fprintf(stderr, "No SMP response (timeout)\n"); goto reconnect; }
-            /* FIXME: parse pairing response properly */
-            fprintf(stderr, "SMP event received\n");
+            int pres_len = 0;
+            uint8_t pres_buf[32];
+            int64_t smp_deadline = now_ms() + 5000;
+            while (now_ms() < smp_deadline && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) {
+                    fprintf(stderr, "  Disconnect (0x%02x) during SMP wait\n", f.status);
+                    goto reconnect;
+                }
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == SMP_CID && f.payload_len >= 1 && f.payload[0] == SMP_OP_PAIRING_RSP) {
+                    pres_len = (int)f.payload_len;
+                    memcpy(pres_buf, f.payload, (size_t)pres_len);
+                    memcpy(s.smp_pres, f.payload, pres_len < 7 ? (size_t)pres_len : 7);
+                    break;
+                }
+            }
+            if (pres_len == 0) {
+                fprintf(stderr, "  No SMP Pairing Response — disconnect\n");
+                goto reconnect;
+            }
+            fprintf(stderr, "  SMP Pairing Response: IO=0x%02x AuthReq=0x%02x MaxKey=%u\n",
+                    pres_buf[1], pres_buf[3], pres_buf[4]);
+            s.state = STATE_SMP_CONFIRM_RANDOM;
         }
 
-        /* Placeholder for full SMP confirm/random/encryption flow */
-        /* (Golden path replay from previously working sw2d_final) */
+        /* Generate confirm values using c1() */
+        {
+            /* Mrand ← random 16 bytes */
+            for (int i = 0; i < 16; i++) s.smp_mrand[i] = (uint8_t)(rand() & 0xFF);
+            smp_c1(s.smp_tk, s.smp_mrand, s.smp_preq, s.smp_pres,
+                   s.local_addr_type, s.local_addr,
+                   s.peer_addr_type, s.peer_addr,
+                   s.smp_mconfirm);
+            fprintf(stderr, "  Mconfirm computed\n");
+        }
+
+        /* Master sends Confirm */
+        {
+            uint8_t c[17]; c[0] = SMP_OP_CONFIRM;
+            memcpy(c+1, s.smp_mconfirm, 16);
+            if (smp_send(cmd_fd, &s, c, 17) < 0) goto reconnect;
+            fprintf(stderr, "  Confirm sent\n");
+        }
+
+        /* Read Slave Confirm */
+        {
+            int got = 0;
+            int64_t dl = now_ms() + 5000;
+            while (now_ms() < dl && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == SMP_CID && f.payload_len == 17 && f.payload[0] == SMP_OP_CONFIRM) {
+                    memcpy(s.smp_sconfirm, f.payload+1, 16);
+                    got = 1; break;
+                }
+            }
+            if (!got) { fprintf(stderr, "  No slave confirm\n"); goto reconnect; }
+            fprintf(stderr, "  Slave confirm received\n");
+        }
+
+        /* Master sends Random */
+        {
+            uint8_t r[17]; r[0] = SMP_OP_RANDOM;
+            memcpy(r+1, s.smp_mrand, 16);
+            if (smp_send(cmd_fd, &s, r, 17) < 0) goto reconnect;
+            fprintf(stderr, "  Random sent\n");
+        }
+
+        /* Read Slave Random */
+        {
+            int got = 0;
+            int64_t dl = now_ms() + 5000;
+            while (now_ms() < dl && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
+                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
+                    f.cid == SMP_CID && f.payload_len == 17 && f.payload[0] == SMP_OP_RANDOM) {
+                    memcpy(s.smp_srand, f.payload+1, 16);
+                    got = 1; break;
+                }
+            }
+            if (!got) { fprintf(stderr, "  No slave random\n"); goto reconnect; }
+            fprintf(stderr, "  Slave random received\n");
+        }
+
+        /* Verify slave confirm */
+        {
+            uint8_t expected[16];
+            smp_c1(s.smp_tk, s.smp_srand, s.smp_preq, s.smp_pres,
+                   s.peer_addr_type, s.peer_addr,
+                   s.local_addr_type, s.local_addr,
+                   expected);
+            if (memcmp(expected, s.smp_sconfirm, 16) != 0) {
+                fprintf(stderr, "  CONFIRM MISMATCH — abort\n");
+                goto reconnect;
+            }
+            fprintf(stderr, "  Confirm MATCH ✓\n");
+        }
+
+        /* Derive STK */
+        {
+            smp_s1(s.smp_tk, s.smp_mrand, s.smp_srand, s.smp_stk);
+            fprintf(stderr, "  STK derived\n");
+        }
+
+        /* LE Start Encryption */
+        {
+            uint8_t enc[28];
+            put_le16(enc+0, s.conn_handle);
+            memset(enc+2, 0, 8);  /* Random */
+            put_le16(enc+10, 0);  /* EDIV */
+            memcpy(enc+12, s.smp_stk, 16); /* LTK = STK */
+            if (raw_send_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_START_ENCRYPTION, enc, sizeof(enc)) < 0)
+                goto reconnect;
+            s.state = STATE_ENCRYPTION_START_SENT;
+            fprintf(stderr, "  LE Start Encryption sent\n");
+        }
+
+        /* Wait for Encryption Change (status 0x00) */
+        {
+            int64_t dl = now_ms() + 5000;
+            int encrypted = 0;
+            while (now_ms() < dl && g_running) {
+                hci_frame_t f;
+                int n = rx_read_frame(&s, &f, 500);
+                if (n <= 0) continue;
+                if (f.pkt_type == HCI_EVENT_PKT) {
+                    if (f.evt_code == EVT_DISCONN_COMPLETE) { fprintf(stderr, "  Disconnect during enc\n"); goto reconnect; }
+                    if (f.evt_code == EVT_ENCRYPT_CHANGE && f.payload_len >= 4 &&
+                        f.payload[2] == 0x00) {
+                        encrypted = 1; break;
+                    }
+                    if (f.evt_code == EVT_ENCRYPT_CHANGE) {
+                        fprintf(stderr, "  Encryption change: status=0x%02x\n", f.payload[2]);
+                    }
+                }
+            }
+            if (!encrypted) { fprintf(stderr, "  Encryption failed\n"); goto reconnect; }
+            s.state = STATE_ENCRYPTED;
+            fprintf(stderr, "*** ENCRYPTED ***\n");
+        }
 
         /* ── ATT/GATT after encryption ─────────────────────────────── */
-        if (s.state != STATE_ENCRYPTED) {
-            fprintf(stderr, "BUG: ATT attempted before LE encryption (state=%s)\n", state_name(s.state));
-            goto reconnect;
-        }
-
-        fprintf(stderr, "=== ENCRYPTED — ATT ready ===\n");
-
-        /* Placeholder for ATT MTU exchange, GATT discovery, CCCD write, notifications */
+        fprintf(stderr, "=== ATT/GATT ===\n");
 
     reconnect:
         if (!g_running) break;
