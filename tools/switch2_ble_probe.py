@@ -215,7 +215,7 @@ class ProbeSession:
 
             self._log(f"  FOUND: {device.address} ({pid_str}) "
                       f"rssi={adv.rssi} name={device.name} "
-                      f"mfg_data={hexdump(mgf_data)}")
+                      f"mfg_data={hexdump(mfg_data)}")
 
             if not found_device:
                 found_device = device
