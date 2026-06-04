@@ -148,6 +148,22 @@ static void hexdump(const char *label, const uint8_t *data, int len) {
     fprintf(stderr, "\n");
 }
 
+static const char *addr_type_name(uint8_t type) {
+    if (type == LE_PUBLIC_ADDRESS) return "public";
+    if (type == LE_RANDOM_ADDRESS) return "random";
+    return "unknown";
+}
+
+static int addr_is_zero(const uint8_t addr[6]) {
+    for (int i = 0; i < 6; i++)
+        if (addr[i]) return 0;
+    return 1;
+}
+
+static int addr_looks_static_random(const uint8_t addr[6]) {
+    return (addr[5] & 0xC0) == 0xC0;
+}
+
 /* ═══ read BDADDR from /sys (works when hci0 is DOWN) ═══════════════════ */
 static int read_local_bdaddr(uint8_t out[6]) {
     FILE *f = fopen("/sys/class/bluetooth/hci0/address", "r");
@@ -177,7 +193,7 @@ static int le_create_conn(session_t *s) {
     put_le16(p + 13, 0x0028);  /* conn interval min (50ms) — Switch 2 sweet spot */
     put_le16(p + 15, 0x0038);  /* conn interval max (70ms) */
     put_le16(p + 17, 0x0000);  /* latency */
-    put_le16(p + 19, 0x0C80);  /* supervision timeout (3.2s) */
+    put_le16(p + 19, 0x0C80);  /* supervision timeout (32s) */
     put_le16(p + 21, 0x0001);  /* min CE */
     put_le16(p + 23, 0x0001);  /* max CE */
     return hci_user_send_cmd(s->hci_fd, OGF_LE_CTL, OCF_LE_CREATE_CONN,
@@ -308,17 +324,29 @@ static int rx_await(session_t *s, uint8_t evt, uint8_t sub,
             /* Extract conn_handle from LE Connection Complete */
             if (f.evt_code == EVT_LE_META &&
                 f.subevent == EVT_LE_CONN_COMPLETE &&
-                f.payload_len >= 18) {
+                f.payload_len >= 19) {
                 uint8_t st = f.payload[1];
                 uint16_t h  = get_le16(f.payload + 2) & 0x0fff;
+                uint8_t role = f.payload[4];
+                uint8_t ev_peer_type = f.payload[5];
                 uint16_t ci = get_le16(f.payload + 12);
+                char ev_peer[18], want_peer[18];
+                ba2str((bdaddr_t *)(f.payload + 6), ev_peer);
+                ba2str((bdaddr_t *)s->peer_addr, want_peer);
                 /* Raw hexdump + diagnostics */
                 fprintf(stderr, "  [rx] LE_CONN_COMPLETE st=0x%02x handle=0x%04x "
-                                "ci=%.2fms raw[0..18]: ",
-                        st, h, ci * 1.25);
+                                "ci=%.2fms peer=%s type=%s role=%u raw[0..18]: ",
+                        st, h, ci * 1.25, ev_peer,
+                        addr_type_name(ev_peer_type), role);
                 for (int i = 0; i < 19 && i < f.payload_len; i++)
                     fprintf(stderr, "%02x ", f.payload[i]);
                 fprintf(stderr, "\n");
+                if (memcmp(f.payload + 6, s->peer_addr, 6) != 0 ||
+                    ev_peer_type != s->peer_addr_type) {
+                    fprintf(stderr, "  [rx] WARN: event peer %s type=%s != requested %s type=%s\n",
+                            ev_peer, addr_type_name(ev_peer_type),
+                            want_peer, addr_type_name(s->peer_addr_type));
+                }
                 if (st == 0x00) {
                     s->conn_handle = h;
                     fprintf(stderr, "  [rx] LE_CONN_COMPLETE SUCCESS "
@@ -562,7 +590,7 @@ static void usage(const char *p) {
         "Usage: %s [OPTIONS]\n\n"
         "Options:\n"
         "  --bdaddr AA:BB:CC:DD:EE:FF   Controller BDADDR\n"
-        "  --peer-addr-type public|random|auto\n"
+        "  --peer-addr-type public|random|auto (default public; auto scans without --bdaddr)\n"
         "  --own-addr-type public|random\n"
         "  --host-bdaddr auto|AA:BB:..   Host BDADDR for USB prep\n"
         "  --auto-scan                   Scan for Switch 2 advertisers\n"
@@ -598,6 +626,7 @@ int main(int argc, char **argv) {
                *own_type_s = "public";
     int usb_init = 0, auto_scan = 0, scan_only = 0, exclusive = 0;
     int kill_bluez = 0, preflight = 0, verbose = 0, send_security_req = 0;
+    int peer_type_explicit = 0;
     int scan_timeout = 10000;
     uint8_t peer[6] = {0}, host_bytes[6] = {0};
     uint8_t peer_type = LE_PUBLIC_ADDRESS, own_type = LE_PUBLIC_ADDRESS;
@@ -605,8 +634,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bdaddr") && i + 1 < argc)
             bdaddr_s = argv[++i];
-        else if (!strcmp(argv[i], "--peer-addr-type") && i + 1 < argc)
+        else if (!strcmp(argv[i], "--peer-addr-type") && i + 1 < argc) {
             peer_type_s = argv[++i];
+            peer_type_explicit = 1;
+        }
         else if (!strcmp(argv[i], "--own-addr-type") && i + 1 < argc)
             own_type_s = argv[++i];
         else if (!strcmp(argv[i], "--host-bdaddr") && i + 1 < argc)
@@ -661,6 +692,14 @@ int main(int argc, char **argv) {
     /* ── Resolve BDADDR ─────────────────────────────────────────── */
     if (bdaddr_s && str2ba(bdaddr_s, (bdaddr_t *)peer) < 0) {
         fprintf(stderr, "ERROR: invalid BDADDR: %s\n", bdaddr_s); return 2;
+    }
+    if (bdaddr_s && !peer_type_explicit && addr_looks_static_random(peer)) {
+        char a[18];
+        ba2str((bdaddr_t *)peer, a);
+        peer_type = LE_RANDOM_ADDRESS;
+        fprintf(stderr, "peer BDADDR %s looks like a static random address; "
+                        "defaulting peer type to random\n", a);
+        fprintf(stderr, "  Override with --peer-addr-type public if btmon proves it is public.\n");
     }
 
     /* ── Resolve host BDADDR ────────────────────────────────────── */
@@ -735,11 +774,21 @@ int main(int argc, char **argv) {
                 if (plen < 3 || ev[0] != EVT_LE_ADV_REPORT) continue;
 
                 uint8_t nrep = ev[1];
-                const uint8_t *rep = ev + 2;
-                for (int ri = 0; ri < nrep && (rep - ev) + 9 <= plen; ri++) {
+                size_t off = 2;
+                for (int ri = 0; ri < nrep && off + 10 <= plen; ri++) {
+                    const uint8_t *rep = ev + off;
                     uint8_t atype = rep[1];
                     memcpy(peer, rep + 2, 6);
                     uint8_t dlen = rep[8];
+                    if (off + 10 + dlen > plen) break;
+                    int8_t rssi = (int8_t)rep[9 + dlen];
+                    if (verbose) {
+                        char a[18];
+                        ba2str((bdaddr_t *)peer, a);
+                        fprintf(stderr, "  ADV: %s type=%s dlen=%u rssi=%d\n",
+                                a, addr_type_name(atype), dlen, rssi);
+                        hexdump("adv_data", rep + 9, dlen);
+                    }
                     for (int di = 0; di + 2 < dlen;) {
                         uint8_t el = rep[9 + di], ty = rep[10 + di];
                         if (!el || di + 1 + (int)el > dlen) break;
@@ -749,7 +798,7 @@ int main(int argc, char **argv) {
                             if (cid == 0x057E || cid == 0x0553) {
                                 char a[18]; ba2str((bdaddr_t *)peer, a);
                                 fprintf(stderr, "  Found: %s type=%s (Nintendo 0x%04x)\n",
-                                        a, atype == LE_RANDOM_ADDRESS ? "random" : "public", cid);
+                                        a, addr_type_name(atype), cid);
                                 peer_type = atype;
                                 found = 1;
                                 break;
@@ -758,7 +807,7 @@ int main(int argc, char **argv) {
                         di += 1 + el;
                     }
                     if (found) break;
-                    rep += 9 + dlen;
+                    off += 10 + dlen;
                 }
             }
             hci_le_set_scan_enable(scan_fd, 0x00, 0x00, 1000);
@@ -775,13 +824,13 @@ int main(int argc, char **argv) {
         system("hciconfig hci0 down 2>/dev/null");
         usleep(200000);
 
-        if (!peer[0] && !peer[1] && !peer[2] && !peer[3] && !peer[4] && !peer[5]) {
+        if (addr_is_zero(peer)) {
             fprintf(stderr, "ERROR: no peer address found\n");
             return 1;
         }
         char a[18]; ba2str((bdaddr_t *)peer, a);
         fprintf(stderr, "peer: %s type=%s\n", a,
-                peer_type == LE_RANDOM_ADDRESS ? "random" : "public");
+                addr_type_name(peer_type));
         if (scan_only) return 0;
     }
 
@@ -817,7 +866,7 @@ int main(int argc, char **argv) {
         ba2str((bdaddr_t *)peer, pstr);
         fprintf(stderr, "local:  %s\npeer:   %s type=%s\nsocket: HCI_CHANNEL_USER\n",
                 lstr, pstr,
-                peer_type == LE_RANDOM_ADDRESS ? "random" : "public");
+                addr_type_name(peer_type));
     }
 
     /* ═══════════════════════════════════════════════════════════════

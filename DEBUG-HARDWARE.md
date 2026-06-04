@@ -43,6 +43,22 @@ On LibreELEC this usually means editing `/flash/cmdline.txt` and rebooting.
 
 ## Capture A: Default SMP Path
 
+Before connecting, discover the current controller address from a fresh
+advertising window. Press the controller's sync button, then run:
+
+```bash
+sudo ./sw2d_final --scan-only --auto-scan --peer-addr-type auto --scan-timeout 15000 --verbose
+```
+
+Expected result:
+
+- `ADV: ... type=random|public` lines while scanning
+- one `Found: AA:BB:CC:DD:EE:FF type=random|public (Nintendo ...)`
+- final `peer: AA:BB:CC:DD:EE:FF type=random|public`
+
+If the printed address differs from the previous run, use the new one. The
+controller can rotate its random address after power-cycle or sync-button use.
+
 Terminal 1:
 
 ```bash
@@ -54,6 +70,13 @@ Terminal 2:
 ```bash
 sudo systemctl stop bluetooth 2>/dev/null || true
 sudo ./sw2d_final --usb-init --auto-scan --peer-addr-type auto --verbose --exclusive-hci
+```
+
+Manual variant, only when the scan already gave you the current address and
+type:
+
+```bash
+sudo ./sw2d_final --bdaddr DE:82:D7:B6:34:DB --peer-addr-type random --verbose --exclusive-hci
 ```
 
 Workflow:
@@ -88,6 +111,7 @@ Copy the daemon text log from the first failed run and keep the matching
 `.btsnoop` file. The important milestones are:
 
 - `Found: ... type=random|public`
+- `peer: ... type=random|public`
 - `LE_CONN_COMPLETE SUCCESS`
 - `Pairing Response`
 - `Confirm MATCH`
@@ -106,6 +130,8 @@ Common meanings:
 - `0x3e`: connection failed to be established
 - no `LE_CONN_COMPLETE` on daemon but visible in `btmon`: likely HCI user/mgmt
   routing problem
+- `LE_CONN_COMPLETE FAILED` with `event peer ... != requested ...`: stale
+  BDADDR, wrong peer address type, or the controller stopped advertising before
+  the connection attempt
 - `SMP Pairing Failed reason=...`: pairing parameter mismatch; compare Capture A
   and Capture B
-

@@ -167,6 +167,27 @@ Offset  Size  Field
   `LE Read Remote Used Features` interference
 - Reboot required for kernel parameter to take effect
 
+### Phase 12: LE Connection Complete Peer Mismatch (Current Blocker)
+
+- With corrected HCI event parsing, `LE Connection Complete` can now be decoded
+  reliably from the raw payload
+- Latest failing trace:
+  ```
+  LE_CONN_COMPLETE st=0xff handle=0x007f
+  raw: 01 ff 7f 00 00 db 34 b6 d7 82 de 1b 43 f4 01 00 00 00 00
+  ```
+- Event peer was `DE:82:D7:B6:34:DB`, not the requested
+  `E0:EF:BF:3B:C6:76`
+- `E0:...` has top bits `11`, so it looks like a static random address; using
+  `peer-addr-type public` is suspicious unless btmon proves otherwise
+- Current hypothesis: stale rotated BDADDR, wrong peer address type, or expired
+  advertising window
+- Debug rule for next hardware run: press sync, run `--scan-only --auto-scan
+  --peer-addr-type auto`, copy the current address and type, then connect with
+  exactly those values
+- Code now logs the peer address and peer type from `LE Connection Complete` and
+  warns when the event peer differs from the requested peer
+
 ### External References
 
 - **[bleno#225](https://github.com/noble/bleno/issues/225):** HCI_CHANNEL_USER usage
@@ -182,7 +203,8 @@ Offset  Size  Field
 - **bluetoothd must be stopped** before running the daemon. Raw HCI requires
   exclusive access to `hci0`. Run `systemctl stop bluetooth` first.
 - Controller BD_ADDR is **random per power cycle**. `E0:EF:BF:3B:C6:76` was the
-  address during development. The daemon accepts BD_ADDR as a CLI argument.
+  address during development. The daemon accepts BDADDR as a CLI argument, but
+  `--auto-scan --peer-addr-type auto` is preferred before each hardware test.
 - ADV_IND packets contain Nintendo Manufacturer Data (`0x0553`) and Flags `0x06`.
   This was confirmed via `btmon` capture during Phase 4 testing.
 
