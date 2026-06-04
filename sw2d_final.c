@@ -77,6 +77,7 @@ typedef hci_user_frame_t hci_frame_t;
 #define SMP_OP_PAIRING_RSP        0x02
 #define SMP_OP_CONFIRM            0x03
 #define SMP_OP_RANDOM             0x04
+#define SMP_OP_PAIRING_FAILED     0x05
 #define SMP_OP_SECURITY_REQUEST   0x0b
 
 /* ═══ state machine ══════════════════════════════════════════════════════ */
@@ -480,6 +481,7 @@ static void usage(const char *p) {
         "  --scan-only                   Scan, print, exit\n"
         "  --usb-init                    Run USB init sequence first\n"
         "  --hidraw PATH                 Hidraw device (default: /dev/hidraw0)\n"
+        "  --send-security-request       Send SMP Security Request before Pairing Request\n"
         "  --exclusive-hci               Check no other BT clients running\n"
         "  --kill-bluez-clients          Kill interfering BT processes\n"
         "  --preflight                   Only check, then exit\n"
@@ -507,7 +509,7 @@ int main(int argc, char **argv) {
     const char *host_spec = "auto", *peer_type_s = "public",
                *own_type_s = "public";
     int usb_init = 0, auto_scan = 0, scan_only = 0, exclusive = 0;
-    int kill_bluez = 0, preflight = 0, verbose = 0;
+    int kill_bluez = 0, preflight = 0, verbose = 0, send_security_req = 0;
     int scan_timeout = 10000;
     uint8_t peer[6] = {0}, host_bytes[6] = {0};
     uint8_t peer_type = LE_PUBLIC_ADDRESS, own_type = LE_PUBLIC_ADDRESS;
@@ -531,6 +533,8 @@ int main(int argc, char **argv) {
             scan_only = 1;
         else if (!strcmp(argv[i], "--usb-init"))
             usb_init = 1;
+        else if (!strcmp(argv[i], "--send-security-request"))
+            send_security_req = 1;
         else if (!strcmp(argv[i], "--exclusive-hci"))
             exclusive = 1;
         else if (!strcmp(argv[i], "--kill-bluez-clients"))
@@ -778,8 +782,11 @@ int main(int argc, char **argv) {
         /* ── Phase 2: SMP Golden Path (PROVEN — byte-identical) ────── */
         fprintf(stderr, "=== SMP Just Works Pairing ===\n");
 
-        /* 2a: Security Request */
-        {
+        /* 2a: Optional Security Request.
+         * In normal BLE SMP, the peripheral sends Security Request and the
+         * central initiates pairing with Pairing Request. Keep this off by
+         * default, but allow trace experiments with old behavior. */
+        if (send_security_req) {
             uint8_t pdu[2] = {SMP_OP_SECURITY_REQUEST, 0x01};
             if (smp_send(&s, pdu, 2) < 0) goto reconnect;
             fprintf(stderr, "  Security Request sent\n");
@@ -805,12 +812,18 @@ int main(int argc, char **argv) {
                 goto reconnect;
             }
             if (rc != 0 || blen < 7 || buf[0] != SMP_OP_PAIRING_RSP) {
+                if (blen >= 2 && buf[0] == SMP_OP_PAIRING_FAILED) {
+                    fprintf(stderr, "  SMP Pairing Failed reason=0x%02x\n", buf[1]);
+                    goto reconnect;
+                }
                 /* Maybe security request echo — retry once */
                 if (blen >= 2 && buf[0] == SMP_OP_SECURITY_REQUEST) {
                     fprintf(stderr, "  (Controller security request echo)\n");
                     blen = sizeof(buf);
                     rc = rx_await_acl(&s, SMP_CID, buf, &blen, 5000);
                     if (rc != 0 || blen < 7 || buf[0] != SMP_OP_PAIRING_RSP) {
+                        if (blen >= 2 && buf[0] == SMP_OP_PAIRING_FAILED)
+                            fprintf(stderr, "  SMP Pairing Failed reason=0x%02x\n", buf[1]);
                         fprintf(stderr, "  No Pairing Response after sec req\n");
                         goto reconnect;
                     }
@@ -924,16 +937,15 @@ int main(int argc, char **argv) {
                     }
                     if (f.evt_code == EVT_ENCRYPT_CHANGE) {
                         fprintf(stderr, "  Encryption change: status=0x%02x handle=0x%04x\n",
-                                f.payload_len >= 3 ? f.payload[2] : 0xFF, f.handle);
-                        if (f.payload_len >= 3 && f.payload[2] == 0x00 &&
-                            f.handle == s.conn_handle) {
+                                f.status, f.handle);
+                        if (f.status == 0x00 && f.handle == s.conn_handle) {
                             encrypted = 1;
                         }
                     }
                     if (f.evt_code == EVT_LE_META &&
                         f.subevent == EVT_LE_LTK_REQUEST &&
-                        f.payload_len >= 10) {
-                        uint16_t h = get_le16(f.payload + 2) & 0x0fff;
+                        f.payload_len >= 13) {
+                        uint16_t h = get_le16(f.payload + 1) & 0x0fff;
                         fprintf(stderr, "  LTK Request handle=0x%04x — replying\n", h);
                         uint8_t ltk_reply[18];
                         put_le16(ltk_reply, h);

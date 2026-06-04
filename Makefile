@@ -39,7 +39,10 @@ test_bdaddr: tests/test_bdaddr.c
 test_adv_parse: tests/test_adv_parse.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
-test: test_args test_bdaddr test_adv_parse
+test_hci_frame: tests/test_hci_frame.c hci_transport_user.c hci_transport_user.h
+	$(CC) $(CFLAGS) -o $@ tests/test_hci_frame.c hci_transport_user.c $(LDLIBS)
+
+test: test_args test_bdaddr test_adv_parse test_hci_frame
 	@echo "=== test_args ==="
 	./test_args
 	@echo ""
@@ -48,6 +51,9 @@ test: test_args test_bdaddr test_adv_parse
 	@echo ""
 	@echo "=== test_adv_parse ==="
 	./test_adv_parse
+	@echo ""
+	@echo "=== test_hci_frame ==="
+	./test_hci_frame
 
 # Cross-compile for aarch64 (RPi5 / LibreELEC)
 aarch64:
@@ -56,4 +62,4 @@ aarch64:
 	aarch64-linux-gnu-gcc -O2 -s -Wall -o sw2d_lib sw2d_lib.c -lbluetooth
 
 clean:
-	rm -f sw2d sw2d_final sw2d_lib hciletest gattdump test_args test_bdaddr test_adv_parse
+	rm -f sw2d sw2d_final sw2d_lib hciletest gattdump test_args test_bdaddr test_adv_parse test_hci_frame

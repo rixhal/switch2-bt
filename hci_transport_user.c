@@ -241,7 +241,7 @@ int hci_user_init(int fd) {
             f.evt_code == EVT_CMD_COMPLETE &&
             f.payload_len >= 3) {
             uint16_t op = get_le16(f.payload + 1);
-            uint8_t  st = f.payload[0];
+            uint8_t  st = f.payload_len >= 4 ? f.payload[3] : 0xff;
             if (op == 0x0C03) { /* HCI_Reset opcode in CMD_COMPLETE */
                 fprintf(stderr, "  [transport]   HCI_Reset complete (status=0x%02x)\n", st);
                 got_reset = 1;
@@ -278,18 +278,16 @@ int hci_user_read_frame(int fd, hci_user_frame_t *f, int timeout_ms) {
     if (pr < 0) return -1;
     if (pr == 0) return 0; /* timeout */
 
-    uint8_t buf[512];
-    ssize_t n = read(fd, buf, sizeof(buf));
+    ssize_t n = read(fd, f->raw, sizeof(f->raw));
     if (n < 1) return n < 0 ? -1 : 0;
 
-    memcpy(f->raw, buf, (size_t)n);
     f->raw_len = (uint16_t)n;
-    f->pkt_type = buf[0];
+    f->pkt_type = f->raw[0];
 
-    if (buf[0] == HCI_EVENT_PKT && n >= 3) {
-        f->evt_code = buf[1];
-        f->payload = buf + 3;
-        f->payload_len = (uint16_t)buf[2];
+    if (f->raw[0] == HCI_EVENT_PKT && n >= 3) {
+        f->evt_code = f->raw[1];
+        f->payload = f->raw + 3;
+        f->payload_len = (uint16_t)f->raw[2];
         f->subevent = 0;
         f->status = 0;
         f->opcode = 0;
@@ -306,18 +304,18 @@ int hci_user_read_frame(int fd, hci_user_frame_t *f, int timeout_ms) {
             f->status = f->payload[3]; /* reason code */
         }
         if (f->evt_code == EVT_ENCRYPT_CHANGE && f->payload_len >= 4) {
-            f->handle = get_le16(f->payload + 0) & 0x0fff;
-            f->status = f->payload[2]; /* 0x00 = success */
+            f->status = f->payload[0]; /* 0x00 = success */
+            f->handle = get_le16(f->payload + 1) & 0x0fff;
         }
         return 1;
     }
 
-    if (buf[0] == HCI_ACLDATA_PKT && n >= 9) {
-        f->handle = get_le16(buf + 1) & 0x0fff;
-        f->acl_len = get_le16(buf + 3);
-        f->l2cap_len = get_le16(buf + 5);
-        f->cid = get_le16(buf + 7);
-        f->payload = buf + 9;
+    if (f->raw[0] == HCI_ACLDATA_PKT && n >= 9) {
+        f->handle = get_le16(f->raw + 1) & 0x0fff;
+        f->acl_len = get_le16(f->raw + 3);
+        f->l2cap_len = get_le16(f->raw + 5);
+        f->cid = get_le16(f->raw + 7);
+        f->payload = f->raw + 9;
         f->payload_len = f->l2cap_len;
         return 1;
     }
