@@ -254,7 +254,7 @@ Offset  Size  Field
   ```
 - Linux impact: the fastest route to a working LibreELEC prototype is now a
   BlueZ-managed BLE/GATT daemon plus `uinput`, not more HCI_CHANNEL_USER work.
-- `tools/switch2_ble_probe.py` now defaults to this `--mode procon2` path and
+- `switch2d.py` now defaults to this `--mode procon2` path and
   decodes long Pro Controller 2 reports directly. With `--uinput`, it maps those
   reports to a virtual Linux gamepad for immediate end-to-end testing.
 - Pre-hardware hardening added:

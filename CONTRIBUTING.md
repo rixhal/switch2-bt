@@ -34,7 +34,7 @@ full research log — read these first to understand what's been tried and what 
 
 4. **Linux Wireless GATT daemon** — Port the working [joycon2cpp](https://github.com/TheFrano/joycon2cpp)
    Windows approach to Linux. The CareyScott GATT protocol is documented in
-   `src/switch2_protocol.c` and `tools/switch2_ble_probe.py`. Use BlueZ D-Bus (via
+   `src/switch2_protocol.c` and `switch2d.py`. Use BlueZ D-Bus (via
    `bleak` or directly) to connect, then run the 2-step init and subscribe to
    input reports. See [JOYCON2CPP_COMPARISON.md](JOYCON2CPP_COMPARISON.md).
 
@@ -73,7 +73,7 @@ python3 -m pytest tests/ -v
 
 ```bash
 # Python probe (BlueZ/bleak path)
-sudo python3 tools/switch2_ble_probe.py --mode procon2 --verbose --connect-retries 5
+sudo python3 switch2d.py --mode procon2 --verbose --connect-retries 5
 
 # BTstack bridge (raw HCI path — stop BlueZ first!)
 systemctl stop bluetooth && hciconfig hci0 down

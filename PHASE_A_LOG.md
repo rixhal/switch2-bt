@@ -52,15 +52,15 @@ The kernel/BlueZ stack on crackberry (standard Raspbian) immediately drops the B
 
 ## Files Created
 
-- `tools/switch2_ble_probe.py` — Phase A probe (bleak + BlueZ backend)
-- `tools/dump_reports.py` — JSONL report analyzer
+- `switch2d.py` — Primary daemon: BlueZ/bleak → uinput
+- `legacy/raw-hci/dump_reports.py` — JSONL report analyzer
 - `src/switch2_protocol.h` — Protocol constants (UUIDs, PIDs, pair keys)
 - `src/switch2_protocol.c` — Payload builder implementation
 - `tests/test_pair_payloads.py` — 17 byte-accurate tests (all pass)
 
 ## Probe CLI
 ```bash
-python3 tools/switch2_ble_probe.py \
+python3 switch2d.py \\
   --address E0:EF:BF:3B:C6:76 \
   --manufacturer 0553 \
   --verbose \
