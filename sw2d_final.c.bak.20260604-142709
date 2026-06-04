@@ -379,7 +379,18 @@ static int le_start_encryption(int cmd_fd, uint16_t handle, const uint8_t ltk[16
  * LE CONNECTION PARAMETER UPDATE
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* LE Connection Parameter Update (inline in main loop) */
+static int le_conn_param_update(int cmd_fd, uint16_t handle) {
+    uint8_t params[14];
+    put_le16(params + 0, handle);
+    put_le16(params + 2, CONN_INTERVAL_MIN_DEFAULT);  /* 7.5ms */
+    put_le16(params + 4, 0x000C);  /* max 15ms */
+    put_le16(params + 6, 0x0000);  /* latency 0 */
+    put_le16(params + 8, 0x01F4);  /* supervision timeout 500 * 10ms = 5s */
+    put_le16(params + 10, 0x0000); /* min CE */
+    put_le16(params + 12, 0x0000); /* max CE */
+    fprintf(stderr, "  LE_Conn_Param_Update: interval=7.5-15ms latency=0 timeout=5s\n");
+    return send_hci_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_CONN_UPDATE, params, 14);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
  * RX FRAME DEMUX — Central read/dispatch
@@ -538,15 +549,11 @@ static int rx_match_await(rx_frame_t *frm, rx_ctx_t *ctx) {
 
         /* Extract connection handle on LE Connection Complete */
         if (frm->le_subevent == LE_META_EV_CONN_COMPLETE && frm->evt_len >= 19) {
-            uint8_t  status   = frm->evt_data[1];
-            uint16_t h        = get_le16(frm->evt_data + 2);
-            /* LE Connection Complete parameter layout (from evt_data[0]=subevent):
-             *   [1]=status [2-3]=handle [4]=role [5]=peer_addr_type
-             *   [6-11]=peer_addr [12-13]=interval [14-15]=latency
-             *   [16-17]=supervision_timeout [18]=master_clock_accuracy */
-            uint16_t interval = get_le16(frm->evt_data + 12);
-            uint16_t latency  = get_le16(frm->evt_data + 14);
-            uint16_t timeout  = get_le16(frm->evt_data + 16);
+            uint8_t status = frm->evt_data[1];
+            uint16_t h = get_le16(frm->evt_data + 2);
+            uint16_t interval = get_le16(frm->evt_data + 13);
+            uint16_t latency  = get_le16(frm->evt_data + 15);
+            uint16_t timeout  = get_le16(frm->evt_data + 17);
             fprintf(stderr, "  CONN_COMPLETE: status=0x%02x handle=0x%04x interval=%.2fms latency=%d timeout=%dms\n",
                     status, h, interval * 1.25, latency, timeout * 10);
             if (status == 0x00) {
@@ -929,18 +936,9 @@ parse_pairing_request: {
         srand[i] = (uint8_t)(rand() & 0xFF);
     }
 
-    /* Master sends Pairing Confirm FIRST (we're the initiator) */
-    /* For TK=0 Just Works: confirm = c1(zero_tk, mrand, preq, pres, ...) */
-    /* Simplified for bring-up: use zero confirm */
-    uint8_t mconfirm_pkt[17];
-    mconfirm_pkt[0] = SMP_PAIRING_CONFIRM;
-    memset(mconfirm_pkt + 1, 0, 16);
-    smp_send(ctx, mconfirm_pkt, sizeof(mconfirm_pkt));
-    fprintf(stderr, "  Master Pairing Confirm sent\n");
-
     /* Now read controller's Pairing Confirm */
     uint8_t sconfirm_pdu[17];
-    int sc_len = smp_read_pdu(ctx, sconfirm_pdu, sizeof(sconfirm_pdu), 5000);
+    int sc_len = smp_read_pdu(ctx, sconfirm_pdu, sizeof(sconfirm_pdu), 8000);
     if (sc_len == 17 && sconfirm_pdu[0] == SMP_PAIRING_CONFIRM) {
         uint8_t sconfirm[16];
         memcpy(sconfirm, sconfirm_pdu + 1, 16);
@@ -950,6 +948,14 @@ parse_pairing_request: {
                 sc_len, sc_len > 0 ? sconfirm_pdu[0] : 0);
         return -1;
     }
+
+    /* Send master Pairing Confirm (with opcode) */
+    /* For TK=0, confirm = 0 (simplified) */
+    uint8_t mconfirm_pkt[17];
+    mconfirm_pkt[0] = SMP_PAIRING_CONFIRM;
+    memset(mconfirm_pkt + 1, 0, 16);
+    smp_send(ctx, mconfirm_pkt, sizeof(mconfirm_pkt));
+    fprintf(stderr, "  Master Pairing Confirm sent\n");
 
     /* Send master Pairing Random */
     uint8_t mrand_pkt[17];
@@ -1025,9 +1031,8 @@ static int att_read_rsp(rx_ctx_t *ctx, uint8_t *buf, int maxlen, int timeout_ms)
         gettimeofday(&now, NULL);
         int remaining = (int)((deadline.tv_sec - now.tv_sec) * 1000 +
                             (deadline.tv_usec - now.tv_usec) / 1000);
+        if (remaining < 10) remaining = 10;
         if (remaining <= 0) return -1;
-        if (remaining > 500) remaining = 500;  /* cap poll interval */
-        if (remaining < 10)  remaining = 10;   /* floor */
 
         uint8_t raw[256];
         int n = rx_read_raw(ctx->rx_fd, raw, (int)sizeof(raw), remaining > 500 ? 500 : remaining);
@@ -1421,48 +1426,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "*** CONNECTED: handle=0x%04x ***\n", ctx.conn_handle);
         ctx.state = STATE_CONNECTED_UNENCRYPTED;
 
-        /* Send Connection Parameter Update to fix absurd intervals
-         * (Cypress CYW43455 may assign 61s+ despite 7.5ms request).
-         * Try progressively larger intervals if the first is rejected. */
-        {
-            static const struct { uint16_t min; uint16_t max; const char *desc; } attempts[] = {
-                {0x000C, 0x0018, "15-30ms"},
-                {0x0018, 0x0028, "30-50ms"},
-                {0x0028, 0x003C, "50-75ms"},
-            };
-            int updated = 0;
-            for (size_t i = 0; i < sizeof(attempts)/sizeof(attempts[0]); i++) {
-                uint8_t params[14];
-                put_le16(params + 0, ctx.conn_handle);
-                put_le16(params + 2, attempts[i].min);
-                put_le16(params + 4, attempts[i].max);
-                put_le16(params + 6, 0x0000);  /* latency 0 */
-                put_le16(params + 8, 0x01F4);  /* supervision timeout 5s */
-                put_le16(params + 10, 0x0000); /* min CE */
-                put_le16(params + 12, 0x0000); /* max CE */
-                fprintf(stderr, "  LE_Conn_Param_Update: interval=%s attempt=%zu\n",
-                        attempts[i].desc, i + 1);
-                send_hci_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_CONN_UPDATE, params, 14);
-
-                /* Wait for Connection Update Complete or disconnect */
-                int rc2 = rx_await(&ctx, EVT_LE_META_EVENT, LE_META_EV_CONN_UPDATE_COMPL, 0, 0, 2000);
-                if (rc2 >= 0 && ctx.await_result == 0) {
-                    fprintf(stderr, "  Conn param update accepted (%s)\n", attempts[i].desc);
-                    updated = 1;
-                    break;
-                }
-                /* Check if we got disconnected during the attempt */
-                if (ctx.state == STATE_DISCONNECTED) {
-                    fprintf(stderr, "  Disconnected during conn update attempt %zu\n", i + 1);
-                    goto reconnect;
-                }
-                fprintf(stderr, "  Conn param update rejected (status=%d), trying next...\n",
-                        ctx.await_result);
-            }
-            if (!updated) {
-                fprintf(stderr, "  WARNING: All conn update attempts rejected, working with assigned interval\n");
-            }
-        }
+        /* Skip Connection Parameter Update — controller rejects it and disconnects.
+         * Work with whatever interval the controller assigns. */
 
         /* ── SMP Pairing ─────────────────────────────────── */
         if (smp_just_works_pairing(&ctx) < 0) {
@@ -1478,19 +1443,6 @@ int main(int argc, char **argv) {
         if (att_send(&ctx, mtu_req, sizeof(mtu_req)) < 0) {
             fprintf(stderr, "  ATT blocked (state=%s)\n", state_name(ctx.state));
             goto reconnect;
-        }
-
-        /* Consume MTU response before GATT discovery */
-        {
-            uint8_t mtu_rsp[8];
-            int mtu_len = att_read_rsp(&ctx, mtu_rsp, sizeof(mtu_rsp), 2000);
-            if (mtu_len >= 3 && mtu_rsp[0] == ATT_OP_EXCHANGE_MTU_RSP) {
-                uint16_t server_rx_mtu = get_le16(mtu_rsp + 1);
-                fprintf(stderr, "  ATT MTU: server_rx=%u\n", server_rx_mtu);
-            } else {
-                fprintf(stderr, "  Note: no MTU response (got %d bytes op=0x%02x) — continuing\n",
-                        mtu_len, mtu_len > 0 ? mtu_rsp[0] : 0);
-            }
         }
 
         /* ── GATT Discovery ──────────────────────────────── */

@@ -1,0 +1,78 @@
+diff --git a/sw2d_final.c b/sw2d_final.c
+--- a/sw2d_final.c
++++ b/sw2d_final.c
+@@ -46,6 +46,354 @@
+ #ifndef EVT_LE_META_EVENT
+ #define EVT_LE_META_EVENT  EVT_LE_META
+ #endif
++
++/* ── OGF definitions (if not in headers) ────────────────────────────── */
++#ifndef OGF_LE_CTL
++#define OGF_LE_CTL 0x08
++#endif
++#ifndef OGF_HOST_CTL
++#define OGF_HOST_CTL 0x03
++#endif
++
++/* ── LE sub-opcodes ─────────────────────────────────────────────────── */
++#ifndef OCF_LE_SET_EVENT_MASK
++#define OCF_LE_SET_EVENT_MASK         0x0001
++#endif
++#ifndef OCF_LE_CONN_UPDATE
++#define OCF_LE_CONN_UPDATE            0x0013
++#endif
++#ifndef OCF_LE_START_ENCRYPTION
++#define OCF_LE_START_ENCRYPTION       0x0019
++#endif
++
++/* ── LE Meta sub-event codes ────────────────────────────────────────── */
++#ifndef EVT_LE_ENHANCED_CONN_COMPLETE
++#define EVT_LE_ENHANCED_CONN_COMPLETE 0x0A
++#endif
++#ifndef EVT_LE_CONN_UPDATE_COMPLETE
++#define EVT_LE_CONN_UPDATE_COMPLETE   0x03
++#endif
++
++/* ── Standard HCI opcodes ───────────────────────────────────────────── */
++#ifndef OCF_RESET
++#define OCF_RESET 0x0003
++#endif
++#ifndef OCF_SET_EVENT_MASK
++#define OCF_SET_EVENT_MASK 0x0001
++#endif
++
++/* ── Encryption Change event ────────────────────────────────────────── */
++#ifndef EVT_ENCRYPT_CHANGE
++#define EVT_ENCRYPT_CHANGE 0x08
++#endif
++
++/* ── SMP constants ──────────────────────────────────────────────────── */
++#define SMP_CID                    0x0006
++#define SMP_OP_PAIRING_REQUEST     0x01
++#define SMP_OP_PAIRING_RESPONSE    0x02
++#define SMP_OP_PAIRING_CONFIRM     0x03
++#define SMP_OP_PAIRING_RANDOM      0x04
++#define SMP_OP_PAIRING_FAILED      0x05
++#define SMP_OP_ENCRYPTION_INFO     0x06
++#define SMP_OP_MASTER_IDENT        0x07
++#define SMP_OP_IDENTITY_INFO       0x08
++#define SMP_OP_IDENTITY_ADDR_INFO  0x09
++#define SMP_OP_SECURITY_REQUEST    0x0B
++
++#define SMP_IO_NOINPUT_NOOUTPUT    0x03
++#define SMP_OOB_NOT_PRESENT        0x00
++#define SMP_AUTHREQ_NONE           0x00
++#define SMP_MAX_ENC_KEY_SIZE       16
++#define SMP_INITIATOR_KEY_DIST     0x03
++#define SMP_RESPONDER_KEY_DIST     0x03
++
++/* ── BLE timing ─────────────────────────────────────────────────────── */
++#define BLE_CONN_INTERVAL_MIN_MS    8
++#define BLE_CONN_INTERVAL_MAX_MS   12
++#define BLE_CONN_LATENCY            0
++#define BLE_SUPERVISION_TIMEOUT_MS 500
++
++/* ── Connection update retry ────────────────────────────────────────── */
++#define CONN_UPDATE_RETRIES 3
++#define CONN_UPDATE_RETRY_DELAY_MS 200
+ 

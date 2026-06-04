@@ -1,38 +1,55 @@
-# Minimal Makefile for sw2d_btstack using BTstack posix-h4
-BTSTACK_ROOT = $(HOME)/btstack
+# Makefile for sw2d_btstack — Switch 2 Pro Controller BLE HID Host
+# Links against BTstack posix-h4. Full, clean build — no cherry-picking.
+BTSTACK_ROOT ?= $(HOME)/btstack
 
-CORE = \
-	btstack_chipset_bcm.c \
-	btstack_link_key_db_tlv.c \
-	btstack_run_loop_posix.c \
-	btstack_tlv_posix.c \
-	btstack_uart_posix.c \
-	hci_dump_posix_fs.c \
-	hci_transport_h4.c \
-	le_device_db_tlv.c \
-	rijndael.c \
-	btstack_stdin_posix.c \
-	btstack_memory.c \
-	btstack_linked_list.c \
-	btstack_memory_pool.c \
-	btstack_run_loop.c \
-	btstack_util.c \
-	ad_parser.c \
-	hci.c \
-	hci_cmd.c \
-	hci_dump.c \
-	hci_event.c \
-	hci_event_builder.c \
-	l2cap.c \
-	l2cap_signaling.c \
-	btstack_tlv.c \
-	btstack_crypto.c \
-	uECC.c \
-	sm.c \
-	btstack_ring_buffer.c \
-	sw2d_btstack.c
+PROJECT_DIR = $(HOME)/switch2-raw
+TARGET = sw2d_btstack
 
-SRC_DIRS = \
+# ── Source modules (same selection as BTstack posix-h4 le_counter) ──
+
+CORE_SRC = \
+	$(BTSTACK_ROOT)/chipset/bcm/btstack_chipset_bcm.c \
+	$(BTSTACK_ROOT)/src/classic/btstack_link_key_db_tlv.c \
+	$(BTSTACK_ROOT)/platform/posix/btstack_run_loop_posix.c \
+	$(BTSTACK_ROOT)/platform/posix/btstack_tlv_posix.c \
+	$(BTSTACK_ROOT)/platform/posix/btstack_uart_posix.c \
+	$(BTSTACK_ROOT)/platform/posix/hci_dump_posix_fs.c \
+	$(BTSTACK_ROOT)/src/hci_transport_h4.c \
+	$(BTSTACK_ROOT)/src/ble/le_device_db_tlv.c \
+	$(BTSTACK_ROOT)/3rd-party/rijndael/rijndael.c \
+	$(BTSTACK_ROOT)/platform/posix/btstack_stdin_posix.c \
+	$(BTSTACK_ROOT)/src/btstack_memory.c \
+	$(BTSTACK_ROOT)/src/btstack_linked_list.c \
+	$(BTSTACK_ROOT)/src/btstack_memory_pool.c \
+	$(BTSTACK_ROOT)/src/btstack_run_loop.c \
+	$(BTSTACK_ROOT)/src/btstack_util.c \
+	$(BTSTACK_ROOT)/src/ad_parser.c \
+	$(BTSTACK_ROOT)/src/hci.c \
+	$(BTSTACK_ROOT)/src/hci_cmd.c \
+	$(BTSTACK_ROOT)/src/hci_dump.c \
+	$(BTSTACK_ROOT)/src/hci_event.c \
+	$(BTSTACK_ROOT)/src/hci_event_builder.c \
+	$(BTSTACK_ROOT)/src/l2cap.c \
+	$(BTSTACK_ROOT)/src/l2cap_signaling.c \
+	$(BTSTACK_ROOT)/src/btstack_tlv.c \
+	$(BTSTACK_ROOT)/src/btstack_crypto.c \
+	$(BTSTACK_ROOT)/3rd-party/micro-ecc/uECC.c \
+	$(BTSTACK_ROOT)/src/sm.c \
+	$(BTSTACK_ROOT)/src/btstack_ring_buffer.c \
+	$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/sbc_encoder.c \
+	$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/sbc_enc_coeffs.c \
+	$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/sbc_enc_bit_alloc_mono.c \
+	$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/sbc_analysis.c \
+	$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/sbc_dct.c \
+	$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/sbc_packing.c \
+	$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/sbc_enc_bit_alloc_ste.c \
+	$(BTSTACK_ROOT)/src/btstack_ltv_builder.c \
+	$(BTSTACK_ROOT)/src/ble/gatt_client.c \
+	$(BTSTACK_ROOT)/src/ble/att_dispatch.c \
+	$(PROJECT_DIR)/sw2d_btstack.c
+
+INC_DIRS = \
+	-I. \
 	-I$(BTSTACK_ROOT)/src/ble \
 	-I$(BTSTACK_ROOT)/src/classic \
 	-I$(BTSTACK_ROOT)/src \
@@ -42,47 +59,65 @@ SRC_DIRS = \
 	-I$(BTSTACK_ROOT)/3rd-party/rijndael \
 	-I$(BTSTACK_ROOT)/3rd-party/micro-ecc \
 	-I$(BTSTACK_ROOT)/3rd-party/tinydir \
-	-I.
+	-I$(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/include \
+	-I$(BTSTACK_ROOT)/3rd-party/bluedroid/decoder/include \
+	-I$(BTSTACK_ROOT)/3rd-party/yxml
 
-OBJS = $(CORE:.c=.o)
+OBJS = $(notdir $(CORE_SRC:.c=.o))
+DEPS = $(OBJS:.o=.d)
 
-CFLAGS = -g -Wall $(SRC_DIRS)
-LDFLAGS = -lm -lpthread
+CC      ?= gcc
+CFLAGS  += -g -Wall $(INC_DIRS)
+LDFLAGS += -lm -lpthread
 
-all: sw2d_btstack
+# ── Targets ──
 
+.PHONY: all clean deploy
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $^ $(LDFLAGS) -o $@
+
+# Generic rule: compile any .c from its full path, object goes to cwd
 %.o: $(BTSTACK_ROOT)/src/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/src/ble/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/src/classic/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/platform/posix/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/chipset/bcm/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/3rd-party/rijndael/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/3rd-party/micro-ecc/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
-%.o: $(BTSTACK_ROOT)/3rd-party/tinydir/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+%.o: $(BTSTACK_ROOT)/3rd-party/bluedroid/encoder/srce/%.c
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+%.o: $(PROJECT_DIR)/%.c
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
-sw2d_btstack: $(OBJS)
-	$(CC) $(OBJS) $(LDFLAGS) -o $@
+# btstack_config.h is project-specific, not the posix-h4 default
+$(PROJECT_DIR)/btstack_config.h:
+	@echo "ERROR: btstack_config.h missing in $(PROJECT_DIR)" && false
+
+# Ensure our config is used
+CFLAGS += -include $(PROJECT_DIR)/btstack_config.h
 
 clean:
-	rm -f *.o sw2d_btstack
+	rm -f *.o *.d $(TARGET)
 
-deploy: sw2d_btstack
-	scp sw2d_btstack root@10.10.10.140:/storage/switch2-bt/sw2d_btstack
+deploy: $(TARGET)
+	scp $(TARGET) root@10.10.10.140:/storage/switch2-bt/$(TARGET)
+
+-include $(DEPS)

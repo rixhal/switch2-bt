@@ -10,6 +10,11 @@
 #include "btstack_config.h"
 #include "btstack.h"
 
+/* Stub: BCM patchram buffer (required by btstack_chipset_bcm but we don't use firmware patching) */
+const uint8_t  brcm_patchram_buf[1]   = {0};
+const uint32_t brcm_patch_ram_length  = 0;
+const uint8_t  brcm_patch_version     = 0;
+
 #define NINTENDO_COMPANY_ID 0x0553
 #define SWITCH_PRO2_VID     0x057E
 #define SWITCH_PRO2_PID     0x2069

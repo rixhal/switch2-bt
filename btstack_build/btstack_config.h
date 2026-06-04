@@ -1,4 +1,4 @@
-// btstack_config.h for sw2d_btstack - Switch 2 BLE HID Host
+// btstack_config.h for sw2d_btstack — Switch 2 BLE HID Host on Raspberry Pi 5 (CYW43455)
 #ifndef BTSTACK_CONFIG_H
 #define BTSTACK_CONFIG_H
 
@@ -6,10 +6,8 @@
 #define ENABLE_CLASSIC
 #define ENABLE_BLE
 #define ENABLE_LE_CENTRAL
-#define ENABLE_LE_PERIPHERAL
 #define ENABLE_GATT_CLIENT
 #define ENABLE_GATT_CLIENT_PAIRING
-#define ENABLE_HOGP
 
 #define ENABLE_LOG_INFO
 #define ENABLE_LOG_ERROR
@@ -23,11 +21,11 @@
 #define MAX_NR_WHITELIST_ENTRIES 1
 #define MAX_NR_GATT_CLIENTS 1
 
-// HCI
+// HCI buffers
 #define HCI_OUTGOING_PRE_BUFFER_SIZE 4
-#define HCI_INCOMING_PRE_BUFFER_SIZE 4
+#define HCI_INCOMING_PRE_BUFFER_SIZE 6
 
-// Controller
+// Controller flow control
 #define ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL
 #define HCI_HOST_ACL_PACKET_NUM 10
 #define HCI_HOST_ACL_PACKET_LEN 512
@@ -38,5 +36,11 @@
 #define NVM_NONE
 #define NVM_NUM_LINK_KEYS 0
 #define NVM_NUM_DEVICE_DB_ENTRIES 1
+
+// Mesh (required by BTstack even if unused)
+#define MAX_NR_MESH_VIRTUAL_ADDRESSES 0
+#define MAX_NR_MESH_SUBNETS            0
+#define MAX_NR_MESH_APPKEYS            0
+#define MAX_NR_MESH_MODELS             0
 
 #endif
