@@ -57,6 +57,26 @@ static void put_le16(uint8_t *p, uint16_t v) {
     p[1] = (uint8_t)(v >> 8);
 }
 
+static int wait_cmd_complete(int fd, uint16_t opcode, int timeout_ms) {
+    int waited = 0;
+    while (waited < timeout_ms) {
+        hci_user_frame_t f;
+        int slice = timeout_ms - waited;
+        if (slice > 200) slice = 200;
+        int rc = hci_user_read_frame(fd, &f, slice);
+        waited += slice;
+        if (rc <= 0) continue;
+
+        if (f.pkt_type == HCI_EVENT_PKT &&
+            f.evt_code == EVT_CMD_COMPLETE &&
+            f.payload_len >= 4 &&
+            get_le16(f.payload + 1) == opcode) {
+            return f.payload[3] == 0x00 ? 0 : -1;
+        }
+    }
+    return -1;
+}
+
 /* ── bring hci0 down via ioctl ────────────────────────────────────────── */
 
 /*
@@ -196,15 +216,14 @@ int hci_user_cancel_connect(int fd) {
         return -1;
     }
 
-    /* Drain the cancel response (CMD_STATUS + CMD_COMPLETE).
-     * We don't care about the actual values — just clear the pipe. */
+    /* Drain only responses belonging to LE Create Connection Cancel. */
     hci_user_frame_t f;
     int drained = 0;
-    for (int i = 0; i < 5 && drained < 2; i++) {
+    for (int i = 0; i < 5 && drained < 1; i++) {
         int rc = hci_user_read_frame(fd, &f, 200);
         if (rc <= 0) break;
-        if (f.pkt_type == HCI_EVENT_PKT &&
-            (f.evt_code == EVT_CMD_STATUS || f.evt_code == EVT_CMD_COMPLETE)) {
+        if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_CMD_COMPLETE &&
+            f.payload_len >= 4 && get_le16(f.payload + 1) == 0x200e) {
             drained++;
         }
     }
@@ -264,7 +283,9 @@ int hci_user_init(int fd) {
                           evtmask, 8) < 0)
         return -1;
     fprintf(stderr, "  [transport]   LE_Set_Event_Mask sent\n");
-    usleep(50000);
+    if (wait_cmd_complete(fd, 0x2001, 1000) < 0) {
+        fprintf(stderr, "  [transport]   WARNING: no successful LE_Set_Event_Mask complete\n");
+    }
 
     fprintf(stderr, "  [transport] Controller init complete\n");
     return 0;
