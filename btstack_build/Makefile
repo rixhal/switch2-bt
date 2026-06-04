@@ -1,23 +1,18 @@
 # Makefile for sw2d_btstack — Switch 2 Pro Controller BLE HID Host
-# Links against BTstack posix-h4. Full, clean build — no cherry-picking.
+# Links against BTstack with Linux HCI socket transport
 BTSTACK_ROOT ?= $(HOME)/btstack
 
 PROJECT_DIR = $(HOME)/switch2-raw
 TARGET = sw2d_btstack
 
-# ── Source modules (same selection as BTstack posix-h4 le_counter) ──
-
 CORE_SRC = \
-	$(BTSTACK_ROOT)/chipset/bcm/btstack_chipset_bcm.c \
-	$(BTSTACK_ROOT)/src/classic/btstack_link_key_db_tlv.c \
 	$(BTSTACK_ROOT)/platform/posix/btstack_run_loop_posix.c \
 	$(BTSTACK_ROOT)/platform/posix/btstack_tlv_posix.c \
-	$(BTSTACK_ROOT)/platform/posix/btstack_uart_posix.c \
 	$(BTSTACK_ROOT)/platform/posix/hci_dump_posix_fs.c \
-	$(BTSTACK_ROOT)/src/hci_transport_h4.c \
+	$(BTSTACK_ROOT)/platform/posix/btstack_stdin_posix.c \
+	$(BTSTACK_ROOT)/platform/linux/hci_transport_linux.c \
 	$(BTSTACK_ROOT)/src/ble/le_device_db_tlv.c \
 	$(BTSTACK_ROOT)/3rd-party/rijndael/rijndael.c \
-	$(BTSTACK_ROOT)/platform/posix/btstack_stdin_posix.c \
 	$(BTSTACK_ROOT)/src/btstack_memory.c \
 	$(BTSTACK_ROOT)/src/btstack_linked_list.c \
 	$(BTSTACK_ROOT)/src/btstack_memory_pool.c \
@@ -55,6 +50,7 @@ INC_DIRS = \
 	-I$(BTSTACK_ROOT)/src \
 	-I$(BTSTACK_ROOT)/platform/embedded \
 	-I$(BTSTACK_ROOT)/platform/posix \
+	-I$(BTSTACK_ROOT)/platform/linux \
 	-I$(BTSTACK_ROOT)/chipset/bcm \
 	-I$(BTSTACK_ROOT)/3rd-party/rijndael \
 	-I$(BTSTACK_ROOT)/3rd-party/micro-ecc \
@@ -70,8 +66,6 @@ CC      ?= gcc
 CFLAGS  += -g -Wall $(INC_DIRS)
 LDFLAGS += -lm -lpthread
 
-# ── Targets ──
-
 .PHONY: all clean deploy
 
 all: $(TARGET)
@@ -79,7 +73,6 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-# Generic rule: compile any .c from its full path, object goes to cwd
 %.o: $(BTSTACK_ROOT)/src/%.c
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
@@ -90,6 +83,9 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/platform/posix/%.c
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
+
+%.o: $(BTSTACK_ROOT)/platform/linux/%.c
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
 %.o: $(BTSTACK_ROOT)/chipset/bcm/%.c
@@ -107,11 +103,6 @@ $(TARGET): $(OBJS)
 %.o: $(PROJECT_DIR)/%.c
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
-# btstack_config.h is project-specific, not the posix-h4 default
-$(PROJECT_DIR)/btstack_config.h:
-	@echo "ERROR: btstack_config.h missing in $(PROJECT_DIR)" && false
-
-# Ensure our config is used
 CFLAGS += -include $(PROJECT_DIR)/btstack_config.h
 
 clean:

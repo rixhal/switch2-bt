@@ -36,6 +36,8 @@
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 
+#include <openssl/evp.h>
+
 /* ═══════════════════════════════════════════════════════════════════════
  * CONSTANTS
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -369,9 +371,10 @@ static int le_create_connection(int cmd_fd, bdaddr_t *peer,
 static int le_start_encryption(int cmd_fd, uint16_t handle, const uint8_t ltk[16]) {
     uint8_t params[28];
     put_le16(params + 0, handle);
-    put_le16(params + 2, 0x0000); /* EDIV=0 for STK */
-    memset(params + 4, 0, 8); /* rand */
-    memcpy(params + 12, ltk, 16); /* LTK/STK */
+    /* LE Start Encryption: Handle | Random(8) | EDIV(2) | LTK(16) */
+    memset(params + 2, 0, 8);        /* Random_Number (8 bytes) */
+    put_le16(params + 10, 0x0000);    /* EDIV=0 for STK */
+    memcpy(params + 12, ltk, 16);     /* LTK/STK */
     return send_hci_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_START_ENCRYPTION, params, 28);
 }
 
@@ -470,6 +473,12 @@ typedef struct {
     uint8_t  smp_tk[16];
     uint8_t  smp_stk[16];
     int      smp_encrypted;
+
+    /* Addresses for SMP c1() computation */
+    uint8_t  peer_addr[6];       /* Controller BDADDR (MSB first, HCI order) */
+    uint8_t  peer_addr_type;     /* 0=public, 1=random */
+    uint8_t  local_addr[6];      /* Host BDADDR */
+    uint8_t  local_addr_type;    /* 0=public, 1=random */
 
     /* Event await */
     uint8_t  await_evt_pending;
@@ -801,13 +810,60 @@ static int smp_read_pdu(rx_ctx_t *ctx, uint8_t *pdu, int maxlen, int timeout_ms)
     return 0;
 }
 
-/* For TK=0: STK = 0 (all zeros) */
+/* ── SMP Crypto: AES-128 via OpenSSL EVP ─────────────────────── */
+
+static int aes_128_encrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int outl = 0, len = 0;
+    EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL);
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+    EVP_EncryptUpdate(ctx, out, &outl, in, 16);
+    EVP_EncryptFinal_ex(ctx, out + outl, &len);
+    EVP_CIPHER_CTX_free(ctx);
+    (void)len;
+    return 0;
+}
+
+/* s1(k, r1, r2) = e(k, r1[0:8] || r2[0:8]) — STK derivation */
+static void smp_s1(uint8_t stk[16], const uint8_t k[16],
+                   const uint8_t r1[16], const uint8_t r2[16]) {
+    uint8_t data[16];
+    memcpy(data,      r1, 8);
+    memcpy(data + 8,  r2, 8);
+    aes_128_encrypt(k, data, stk);
+}
+
+/* c1(k, r, preq, pres, iat, ia, rat, ra) — confirm value */
+static void smp_c1(uint8_t confirm[16],
+                   const uint8_t k[16], const uint8_t r[16],
+                   const uint8_t preq[7], const uint8_t pres[7],
+                   uint8_t iat, const uint8_t ia[6],
+                   uint8_t rat, const uint8_t ra[6]) {
+    uint8_t p1[16], p2[16], tmp[16];
+    /* p1 = pres || preq || rat || iat */
+    memcpy(p1,      pres, 7);
+    memcpy(p1 + 7,  preq, 7);
+    p1[14] = rat;
+    p1[15] = iat;
+    /* tmp = r XOR p1 */
+    for (int i = 0; i < 16; i++) tmp[i] = r[i] ^ p1[i];
+    /* tmp = e(k, tmp) */
+    aes_128_encrypt(k, tmp, tmp);
+    /* p2 = 0x00000000 || ia || ra */
+    memset(p2, 0, 4);
+    memcpy(p2 + 4,  ia, 6);
+    memcpy(p2 + 10, ra, 6);
+    /* tmp = tmp XOR p2 */
+    for (int i = 0; i < 16; i++) tmp[i] ^= p2[i];
+    /* confirm = e(k, tmp) */
+    aes_128_encrypt(k, tmp, confirm);
+}
+
+/* STK = s1(tk, srand, mrand) */
 static int smp_stk_gen(uint8_t stk[16], const uint8_t tk[16],
                         const uint8_t mrand[16], const uint8_t srand[16]) {
-    /* STK = s1(tk, srand, mrand) = e(tk, srand[0:8] || mrand[0:8]) */
-    /* For TK=0 (Just Works), STK = 0 (all zeros) */
-    (void)tk; (void)mrand; (void)srand;
-    memset(stk, 0, 16);
+    smp_s1(stk, tk, srand, mrand);
     return 0;
 }
 
@@ -924,19 +980,30 @@ parse_pairing_request: {
 
     /* Generate randoms */
     uint8_t mrand[16], srand[16];
+    uint8_t tk[16] = {0}; /* TK=0 for Just Works */
     for (int i = 0; i < 16; i++) {
         mrand[i] = (uint8_t)(rand() & 0xFF);
         srand[i] = (uint8_t)(rand() & 0xFF);
     }
 
-    /* Master sends Pairing Confirm FIRST (we're the initiator) */
-    /* For TK=0 Just Works: confirm = c1(zero_tk, mrand, preq, pres, ...) */
-    /* Simplified for bring-up: use zero confirm */
-    uint8_t mconfirm_pkt[17];
-    mconfirm_pkt[0] = SMP_PAIRING_CONFIRM;
-    memset(mconfirm_pkt + 1, 0, 16);
-    smp_send(ctx, mconfirm_pkt, sizeof(mconfirm_pkt));
-    fprintf(stderr, "  Master Pairing Confirm sent\n");
+    /* Compute and send master Pairing Confirm via c1() */
+    /* preq/pres are set above: preq = controller's request, mpreq = our request.
+     * As initiator: our confirm uses our preq + controller's pres. */
+    {
+        uint8_t confirm[16];
+        /* In simultaneous initiation: preq=controller's request, pres=controller's response.
+         * c1 uses: our preq (mpreq) as initiator preq, controller's preq/pres as responder pres */
+        smp_c1(confirm, tk, mrand,
+               mpreq,             /* our Pairing Request (initiator) */
+               preq,              /* controller's Pairing Request/Response (responder) */
+               ctx->local_addr_type, ctx->local_addr,
+               ctx->peer_addr_type,  ctx->peer_addr);
+        uint8_t mconfirm_pkt[17];
+        mconfirm_pkt[0] = SMP_PAIRING_CONFIRM;
+        memcpy(mconfirm_pkt + 1, confirm, 16);
+        smp_send(ctx, mconfirm_pkt, sizeof(mconfirm_pkt));
+        dbg_hex("master confirm", confirm, 16);
+    }
 
     /* Now read controller's Pairing Confirm */
     uint8_t sconfirm_pdu[17];
@@ -970,33 +1037,60 @@ parse_pairing_request: {
     fprintf(stderr, "  Slave Pairing Random received\n");
 
     /* Derive STK */
-    uint8_t tk[16] = {0}; /* TK=0 for Just Works */
     smp_stk_gen(ctx->smp_stk, tk, mrand, srand);
     dbg_hex("STK", ctx->smp_stk, 16);
 
     ctx->state = STATE_SMP_PAIRING_COMPLETE;
     fprintf(stderr, "  SMP Pairing Complete (Just Works)\n");
 
-    /* Start Encryption */
-    fprintf(stderr, "=== LE Start Encryption ===\n");
-    le_start_encryption(ctx->cmd_fd, ctx->conn_handle, ctx->smp_stk);
-
+    /* Wait for LTK Request from controller, then reply with STK.
+     * Some controllers (Cypress CYW43455) reject LE Start Encryption
+     * but accept the LTK Request/Reply flow. */
+    fprintf(stderr, "=== Waiting for LTK Request ===\n");
     ctx->state = STATE_ENCRYPTION_START_SENT;
+    {
+        struct timeval start, now;
+        gettimeofday(&start, NULL);
+        int ltk_handled = 0;
+        while (!ctx->smp_encrypted && g_running && !ltk_handled) {
+            gettimeofday(&now, NULL);
+            int elapsed = (int)((now.tv_sec - start.tv_sec) * 1000 +
+                               (now.tv_usec - start.tv_usec) / 1000);
+            if (elapsed > 2000) {
+                /* No LTK Request — try direct encryption start */
+                fprintf(stderr, "  No LTK Request, trying LE Start Encryption\n");
+                le_start_encryption(ctx->cmd_fd, ctx->conn_handle, ctx->smp_stk);
+                /* Fall through to encryption wait */
+                break;
+            }
+            int remaining = 2000 - elapsed;
+            int rc = rx_dispatch(ctx, remaining > 0 ? remaining : 100);
+            if (rc == 4) {
+                /* LTK Request handled — LTK Reply sent, now wait for encryption */
+                fprintf(stderr, "  LTK Reply sent, waiting for encryption...\n");
+                ltk_handled = 1;
+            } else if (rc < 0) {
+                return rc;
+            }
+        }
+    }
 
     /* Wait for Encryption Change event */
-    struct timeval start, now;
-    gettimeofday(&start, NULL);
-    while (!ctx->smp_encrypted && g_running) {
-        gettimeofday(&now, NULL);
-        int elapsed = (int)((now.tv_sec - start.tv_sec) * 1000 +
-                           (now.tv_usec - start.tv_usec) / 1000);
-        if (elapsed > 5000) {
-            fprintf(stderr, "  Encryption Change timeout\n");
-            return -1;
+    {
+        struct timeval start, now;
+        gettimeofday(&start, NULL);
+        while (!ctx->smp_encrypted && g_running) {
+            gettimeofday(&now, NULL);
+            int elapsed = (int)((now.tv_sec - start.tv_sec) * 1000 +
+                               (now.tv_usec - start.tv_usec) / 1000);
+            if (elapsed > 5000) {
+                fprintf(stderr, "  Encryption Change timeout\n");
+                return -1;
+            }
+            int remaining = 5000 - elapsed;
+            int rc = rx_dispatch(ctx, remaining > 0 ? remaining : 100);
+            if (rc < 0) return rc;
         }
-        int remaining = 5000 - elapsed;
-        int rc = rx_dispatch(ctx, remaining > 0 ? remaining : 100);
-        if (rc < 0) return rc;
     }
 
     if (!ctx->smp_encrypted) {
@@ -1377,16 +1471,22 @@ int main(int argc, char **argv) {
     }
 
     /* ── RX Context ───────────────────────────────────────────────── */
+    bdaddr_t local_ba;
     rx_ctx_t ctx = {
         .rx_fd = rx_fd,
         .cmd_fd = cmd_fd,
         .conn_handle = 0,
         .state = STATE_DISCONNECTED,
         .verbose = verbose,
+        .peer_addr_type = peer_type,
+        .local_addr_type = own_type,
     };
+    /* Copy addresses into ctx (HCI/BDADDR byte order: LSB first) */
+    memcpy(ctx.peer_addr, &peer, 6);
+    if (hci_devba(dev_id, &local_ba) == 0)
+        memcpy(ctx.local_addr, &local_ba, 6);
 
     /* Log device info */
-    bdaddr_t local_ba;
     char local_str[18] = "unknown";
     if (hci_devba(dev_id, &local_ba) == 0) ba2str(&local_ba, local_str);
     fprintf(stderr, "=== %s ===\n", APP_NAME);
@@ -1420,49 +1520,8 @@ int main(int argc, char **argv) {
 
         fprintf(stderr, "*** CONNECTED: handle=0x%04x ***\n", ctx.conn_handle);
         ctx.state = STATE_CONNECTED_UNENCRYPTED;
-
-        /* Send Connection Parameter Update to fix absurd intervals
-         * (Cypress CYW43455 may assign 61s+ despite 7.5ms request).
-         * Try progressively larger intervals if the first is rejected. */
-        {
-            static const struct { uint16_t min; uint16_t max; const char *desc; } attempts[] = {
-                {0x000C, 0x0018, "15-30ms"},
-                {0x0018, 0x0028, "30-50ms"},
-                {0x0028, 0x003C, "50-75ms"},
-            };
-            int updated = 0;
-            for (size_t i = 0; i < sizeof(attempts)/sizeof(attempts[0]); i++) {
-                uint8_t params[14];
-                put_le16(params + 0, ctx.conn_handle);
-                put_le16(params + 2, attempts[i].min);
-                put_le16(params + 4, attempts[i].max);
-                put_le16(params + 6, 0x0000);  /* latency 0 */
-                put_le16(params + 8, 0x01F4);  /* supervision timeout 5s */
-                put_le16(params + 10, 0x0000); /* min CE */
-                put_le16(params + 12, 0x0000); /* max CE */
-                fprintf(stderr, "  LE_Conn_Param_Update: interval=%s attempt=%zu\n",
-                        attempts[i].desc, i + 1);
-                send_hci_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_CONN_UPDATE, params, 14);
-
-                /* Wait for Connection Update Complete or disconnect */
-                int rc2 = rx_await(&ctx, EVT_LE_META_EVENT, LE_META_EV_CONN_UPDATE_COMPL, 0, 0, 2000);
-                if (rc2 >= 0 && ctx.await_result == 0) {
-                    fprintf(stderr, "  Conn param update accepted (%s)\n", attempts[i].desc);
-                    updated = 1;
-                    break;
-                }
-                /* Check if we got disconnected during the attempt */
-                if (ctx.state == STATE_DISCONNECTED) {
-                    fprintf(stderr, "  Disconnected during conn update attempt %zu\n", i + 1);
-                    goto reconnect;
-                }
-                fprintf(stderr, "  Conn param update rejected (status=%d), trying next...\n",
-                        ctx.await_result);
-            }
-            if (!updated) {
-                fprintf(stderr, "  WARNING: All conn update attempts rejected, working with assigned interval\n");
-            }
-        }
+        /* Connection interval is 15ms from LE_Create_Connection — good enough.
+         * Conn Param Update rejected by Cypress CYW43455, skip to avoid disconnects. */
 
         /* ── SMP Pairing ─────────────────────────────────── */
         if (smp_just_works_pairing(&ctx) < 0) {

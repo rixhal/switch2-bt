@@ -51,7 +51,7 @@ test: test_args test_bdaddr test_adv_parse
 
 # Cross-compile for aarch64 (RPi5 / LibreELEC)
 aarch64:
-	aarch64-linux-gnu-gcc -O2 -s -Wall -o sw2d_final sw2d_final.c -lbluetooth
+	aarch64-linux-gnu-gcc -O2 -s -Wall -o sw2d_final sw2d_final.c -lbluetooth -lcrypto
 	aarch64-linux-gnu-gcc -O2 -s -Wall -o hciletest hciletest.c -lbluetooth
 	aarch64-linux-gnu-gcc -O2 -s -Wall -o sw2d_lib sw2d_lib.c -lbluetooth
 
