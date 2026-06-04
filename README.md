@@ -1,5 +1,17 @@
 # Switch 2 Pro Controller — Bluetooth Daemon
 
+> ⚠️ **STATUS: NOT WORKING (Wireless BLE)** — June 2026  
+> USB kernel driver works. Wireless BLE connection **does not** work yet on
+> Linux. The Cypress CYW43455 chip on Raspberry Pi blocks raw HCI LE Create
+> Connection. BlueZ MGMT layer filters zero-byte scan responses. BTstack
+> bypasses both but the controller rejects standard BLE SMP pairing.
+>
+> **Working paths (on Windows):** [joycon2cpp](https://github.com/TheFrano/joycon2cpp)
+> by TheFrano successfully connects wirelessly via Windows BLE stack + CareyScott
+> GATT protocol. We're porting this approach to Linux.
+>
+> See [RESEARCH.md](RESEARCH.md) for full timeline of dead ends and breakthroughs.
+
 Raw-HCI / BlueZ-GATT research daemon for connecting a Nintendo Switch 2 Pro
 Controller via Bluetooth Low Energy and exposing it as a standard Linux gamepad.
 
@@ -171,5 +183,19 @@ to BLE advertising mode on USB detach.
 
 ## Credits
 
-Built on crackberry (Raspberry Pi 4 + LibreELEC) for crackbery5 (Raspberry Pi 5).
-Nintendo subcommands from SDL2 source code and Nohzockt/ndeadly implementations.
+- **[TheFrano/joycon2cpp](https://github.com/TheFrano/joycon2cpp)** — Windows wireless proof-of-concept
+  using CareyScott GATT protocol (Pro Controller 2 init sequence, report format, button masks)
+- **[CareyScott/switch2controllerpc](https://github.com/CareyScott/switch2controllerpc)** — GATT pairing
+  protocol reverse-engineering (SetMAC, LTK1/LTK2/Finish, UUID discovery)
+- **[bluekitchen/btstack](https://github.com/bluekitchen/btstack)** — Bluetooth Host stack used for
+  HCI_CHANNEL_USER bypass on CYW43455 (port/linux)
+- **SDL2** — `SDL_hidapi_switch2.c` for USB subcommand discovery (SetHCIState, BluetoothManualPair)
+- **[Nohzockt/BlueRetro](https://github.com/Nohzockt/Switch2-Controllers)** — Switch 2 Pro Controller
+  research, GATT UUIDs, init sequence (v1.8 release)
+- **[ndeadly/MissionControl](https://github.com/ndeadly/MissionControl)** — Switch controller GATT
+  research, UUIDs, button mapping, report format
+- **BlueZ** — `hcilecreateconn` test program validated libbluetooth connection approach
+- **[Akashem06/RPI_Bluetooth](https://github.com/Akashem06/RPI_Bluetooth)** — Raw-HCI host layer on RPi4
+- **[bleno#225](https://github.com/noble/bleno/issues/225)** — HCI_CHANNEL_USER usage pattern on Linux
+- **Claude** — Architectural review, code audit, root cause analysis of SMP error 0x13
+- **Codex** — Initial sw2d.c and sw2d_final.c implementations
