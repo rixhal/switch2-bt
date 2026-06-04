@@ -468,6 +468,94 @@ static void kill_bluez_clients(void) {
     usleep(500000);
 }
 
+static int file_contains(const char *path, const char *needle) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[512];
+    int found = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strstr(buf, needle)) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static int command_exists(const char *cmd) {
+    char line[128];
+    snprintf(line, sizeof(line), "command -v %s >/dev/null 2>&1", cmd);
+    return system(line) == 0;
+}
+
+static int path_exists(const char *path) {
+    return access(path, F_OK) == 0;
+}
+
+static int run_preflight(const char *hidraw, int exclusive) {
+    int rc = 0;
+    uint8_t local[6];
+
+    fprintf(stderr, "=== Preflight ===\n");
+
+    if (geteuid() == 0) {
+        fprintf(stderr, "  uid: root OK\n");
+    } else {
+        fprintf(stderr, "  WARN: not running as root; raw HCI/UHID will likely fail\n");
+        rc = 1;
+    }
+
+    if (path_exists("/sys/class/bluetooth/hci0")) {
+        fprintf(stderr, "  hci0: present\n");
+    } else {
+        fprintf(stderr, "  ERROR: /sys/class/bluetooth/hci0 missing\n");
+        rc = 1;
+    }
+
+    if (read_local_bdaddr(local) == 0) {
+        fprintf(stderr, "  host BDADDR: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                local[5], local[4], local[3], local[2], local[1], local[0]);
+    } else {
+        fprintf(stderr, "  WARN: could not read host BDADDR from sysfs\n");
+    }
+
+    if (path_exists("/dev/uhid")) {
+        fprintf(stderr, "  /dev/uhid: present\n");
+    } else {
+        fprintf(stderr, "  WARN: /dev/uhid missing; UHID input creation will fail\n");
+    }
+
+    if (path_exists(hidraw)) {
+        fprintf(stderr, "  %s: present\n", hidraw);
+    } else {
+        fprintf(stderr, "  NOTE: %s missing; OK if not using --usb-init yet\n", hidraw);
+    }
+
+    fprintf(stderr, "  btmon: %s\n", command_exists("btmon") ? "present" : "missing");
+    fprintf(stderr, "  hciconfig: %s\n", command_exists("hciconfig") ? "present" : "missing");
+
+    int clients = check_bluez_clients();
+    if (clients > 0) {
+        fprintf(stderr, "  WARN: %d possible Bluetooth client(s) running\n", clients);
+        if (exclusive) rc = 1;
+    } else if (clients == 0) {
+        fprintf(stderr, "  BlueZ clients: none detected\n");
+    } else {
+        fprintf(stderr, "  WARN: could not inspect /proc for BlueZ clients\n");
+    }
+
+    if (file_contains("/proc/cmdline", "bluetooth.disable_mgmt=1")) {
+        fprintf(stderr, "  kernel mgmt: bluetooth.disable_mgmt=1 set\n");
+    } else {
+        fprintf(stderr, "  NOTE: bluetooth.disable_mgmt=1 not seen in /proc/cmdline\n");
+        fprintf(stderr, "        If HCI_CHANNEL_USER misses connection events on Pi, test this kernel arg.\n");
+    }
+
+    fprintf(stderr, "Preflight %s\n", rc ? "completed with warnings" : "OK");
+    return rc;
+}
+
 /* ═══ usage ═══════════════════════════════════════════════════════════════ */
 static void usage(const char *p) {
     fprintf(stderr,
@@ -557,6 +645,9 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     setvbuf(stderr, NULL, _IOLBF, 0);
 
+    if (preflight)
+        return run_preflight(hidraw, exclusive);
+
     /* ── BlueZ guard ─────────────────────────────────────────────── */
     if (exclusive || kill_bluez) {
         int c = check_bluez_clients();
@@ -565,7 +656,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR: %d BT client(s) running. Use --kill-bluez-clients.\n", c);
             return 1;
         }
-        if (preflight) { fprintf(stderr, "Pre-flight OK.\n"); return 0; }
     }
 
     /* ── Resolve BDADDR ─────────────────────────────────────────── */
