@@ -407,9 +407,9 @@ static int rx_await_acl(session_t *s, uint16_t cid, uint8_t *out,
             }
             if (f.evt_code == EVT_ENCRYPT_CHANGE && f.status == 0x00)
                 s->state = STATE_ENCRYPTED;
-            if (s->verbose)
-                fprintf(stderr, "  [rx] %s while waiting for ACL\n",
-                        f.evt_code == EVT_LE_META ? "LE_META" : "EVENT");
+            /* Always log what event arrived — critical for SMP debug */
+            fprintf(stderr, "  [rx] evt=0x%02x while waiting for ACL cid=0x%04x\n",
+                    f.evt_code, cid);
             continue;
         }
 
@@ -793,14 +793,13 @@ int main(int argc, char **argv) {
                     for (int di = 0; di + 2 < dlen;) {
                         uint8_t el = rep[9 + di], ty = rep[10 + di];
                         if (!el || di + 1 + (int)el > dlen) break;
-                        if (ty == 0xFF && el >= 7) {
+                        if (ty == 0xFF && el >= 3) {
                             uint16_t cid = rep[11+di] | (rep[12+di] << 8);
-                            uint16_t vid = rep[13+di] | (rep[14+di] << 8);
-                            uint16_t pid = rep[15+di] | (rep[16+di] << 8);
-                            if (cid == 0x0553 && vid == 0x057E && pid == 0x2069) {
+                            /* Nintendo: 0x0553 (Switch 2) or 0x057E (classic) */
+                            if (cid == 0x0553 || cid == 0x057E) {
                                 char a[18]; ba2str((bdaddr_t *)peer, a);
-                                fprintf(stderr, "  Found: %s type=%s (Nintendo cid=0x%04x vid=0x%04x pid=0x%04x)\n",
-                                        a, addr_type_name(atype), cid, vid, pid);
+                                fprintf(stderr, "  Found: %s type=%s (Nintendo cid=0x%04x)\n",
+                                        a, addr_type_name(atype), cid);
                                 peer_type = atype;
                                 found = 1;
                                 break;
@@ -919,6 +918,9 @@ int main(int argc, char **argv) {
         }
         s.state = STATE_CONNECTED_UNENCRYPTED;
         fprintf(stderr, "*** CONNECTED handle=0x%04x ***\n", s.conn_handle);
+
+        /* Let connection settle before SMP — CYW43455 may need this */
+        usleep(200000);
 
         /* ── Phase 2: SMP Golden Path (PROVEN — byte-identical) ────── */
         fprintf(stderr, "=== SMP Just Works Pairing ===\n");
