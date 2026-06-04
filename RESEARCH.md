@@ -207,6 +207,64 @@ Offset  Size  Field
   reports require Bluetooth SMP, vendor-specific GATT pairing (`0x15` sequence),
   or both in a specific order.
 
+### Phase 14: Windows Wireless Success via joycon2cpp (2026-06-04)
+
+- `TheFrano/joycon2cpp` successfully connected the Switch 2 Pro Controller
+  wirelessly on Windows and exposed it through ViGEmBus.
+- This proves the controller can run as a usable wireless PC controller without
+  USB and without our raw-HCI daemon.
+- Important architectural finding: joycon2cpp does **not** implement the HCI
+  connection itself. It lets the Windows BLE stack connect, then performs GATT
+  discovery, writes a small custom init sequence, subscribes to notifications,
+  and maps reports to a virtual controller.
+- Advertising filter:
+  - Manufacturer ID: `0x0553` (`1363`)
+  - Prefix: `01 00 03 7e`
+- GATT UUIDs used by the working path:
+  - Input notify: `ab7de9be-89fe-49ad-828f-118f09df7fd2`
+  - Command write: `649d4ac9-8eb7-4e6c-af44-1ea54fe5f005`
+- Minimal init writes, sent with Write Without Response:
+  ```text
+  0c 91 01 02 00 04 00 00 ff 00 00 00
+  0c 91 01 04 00 04 00 00 ff 00 00 00
+  ```
+- Optional LED/sound writes:
+  ```text
+  09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00
+  0a 91 01 02 00 08 00 00 04 00 00 00 00 00 00 00
+  ```
+- Pro Controller 2 report layout from joycon2cpp:
+  - Minimum length: `0x3c`
+  - Button state: bytes `3..8` as a 48-bit big-endian bitfield
+  - Left stick: bytes `10..12`, 12-bit packed X/Y
+  - Right stick: bytes `13..15`, 12-bit packed X/Y
+  - Accel: `0x30..0x35`
+  - Gyro: `0x36..0x3b`
+- Button masks:
+  ```text
+  A=0x000800000000  B=0x000400000000
+  X=0x000200000000  Y=0x000100000000
+  L=0x000000400000  R=0x004000000000
+  ZL=0x000000800000 ZR=0x008000000000
+  Back=0x000001000000 Start=0x000002000000 Home=0x000010000000
+  L3=0x000008000000 R3=0x000004000000
+  DpadU=0x000000020000 DpadD=0x000000010000
+  DpadL=0x000000080000 DpadR=0x000000040000
+  GL=0x000000000200 GR=0x000000000100
+  ```
+- Linux impact: the fastest route to a working LibreELEC prototype is now a
+  BlueZ-managed BLE/GATT daemon plus `uinput`, not more HCI_CHANNEL_USER work.
+- `tools/switch2_ble_probe.py` now defaults to this `--mode procon2` path and
+  decodes long Pro Controller 2 reports directly. With `--uinput`, it maps those
+  reports to a virtual Linux gamepad for immediate end-to-end testing.
+- Pre-hardware hardening added:
+  - `--connect-retries` for short/unstable advertising windows
+  - `--gatt-retries` for BlueZ service-cache delays after connect
+  - `--notify-before-init` to test alternate ordering if init writes race with
+    notification setup
+  - verbose logging for Nintendo manufacturer packets that do not match PID
+    `0x2069`
+
 ### External References
 
 - **[bleno#225](https://github.com/noble/bleno/issues/225):** HCI_CHANNEL_USER usage

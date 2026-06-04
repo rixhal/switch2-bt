@@ -1,7 +1,7 @@
 # Switch 2 Pro Controller — Bluetooth Daemon
 
-Raw-HCI daemon that connects a Nintendo Switch 2 Pro Controller via Bluetooth Low Energy
-and exposes it as a standard UHID gamepad. No BlueZ pairing needed.
+Raw-HCI / BlueZ-GATT research daemon for connecting a Nintendo Switch 2 Pro
+Controller via Bluetooth Low Energy and exposing it as a standard Linux gamepad.
 
 ## The Problem
 
@@ -80,6 +80,60 @@ systemctl stop bluetooth
 # Test without UHID (GATT probing only)
 ./sw2d_final --no-uhid
 ```
+
+## Current Recommended Wireless Probe
+
+The Windows `joycon2cpp` project proved a simpler wireless path: let the OS BLE
+stack establish the link, then use custom GATT commands and notifications. The
+Linux equivalent is now in `tools/switch2_ble_probe.py`.
+
+```bash
+python3 -m pip install bleak evdev
+
+# Hold the controller Sync button until the LEDs blink, then run:
+sudo python3 tools/switch2_ble_probe.py \
+  --mode procon2 \
+  --uinput \
+  --scan-timeout 30 \
+  --connect-retries 5 \
+  --gatt-retries 10 \
+  --notify-timeout 60 \
+  --max-reports 200 \
+  --no-sound \
+  --dump-jsonl procon2_reports.jsonl
+```
+
+This scans for Nintendo manufacturer data `0x0553` with the Switch 2 prefix,
+connects via BlueZ/Bleak, writes the joycon2cpp-proven Pro Controller 2 init
+commands to `649d4ac9-8eb7-4e6c-af44-1ea54fe5f005`, subscribes to
+`ab7de9be-89fe-49ad-828f-118f09df7fd2`, and decodes long Pro Controller reports.
+With `--uinput`, it also creates a virtual Linux gamepad via `/dev/uinput`.
+
+If GATT connects but no reports arrive, retry with notification subscription
+before the init writes:
+
+```bash
+sudo python3 tools/switch2_ble_probe.py \
+  --mode procon2 \
+  --uinput \
+  --notify-before-init \
+  --scan-timeout 30 \
+  --connect-retries 5 \
+  --gatt-retries 10 \
+  --notify-timeout 60 \
+  --no-sound \
+  --dump-jsonl procon2_reports_notify_first.jsonl
+```
+
+Successful reports should be at least `0x3c` bytes. The decoded layout is:
+
+| Field | Offset |
+|---|---|
+| Buttons | bytes `3..8` as a 48-bit bitfield |
+| Left stick | bytes `10..12`, 12-bit packed X/Y |
+| Right stick | bytes `13..15`, 12-bit packed X/Y |
+| Accel | bytes `0x30..0x35` |
+| Gyro | bytes `0x36..0x3b` |
 
 ### USB Prep Workflow
 
