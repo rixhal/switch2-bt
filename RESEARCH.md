@@ -144,6 +144,39 @@ Offset  Size  Field
 - **Remaining:** Controller still drops connection before ATT — needs protocol analysis
 - Reconnect loop: ✅ 1s → 2s → 4s → 8s backoff, handles disconnects gracefully
 
+### Phase 11: HCI_CHANNEL_USER Kernel Routing Bug (2026-06-04)
+
+- **btmon confirmed:** Connection Complete events are visible on HCI_CHANNEL_MONITOR
+  but never delivered to HCI_CHANNEL_USER socket on Kernel 6.12.56 (Cypress CYW43455)
+- Advertising Reports arrive correctly — only connection-level events are affected
+- `setsockopt(HCI_FILTER)` returns `EBADF` on HCI_CHANNEL_USER (filters are
+  HCI_CHANNEL_RAW-only)
+- `ioctl(HCIDEVUP)` returns `EBADF` on HCI_CHANNEL_USER (uses separate control path)
+- **Workaround:** `system("hciconfig hci0 up")` after bind brings the device up
+- bind sequence: `hciconfig hci0 down` → `bind(HCI_CHANNEL_USER)` → `hciconfig hci0 up`
+  (from **bleno#225** — sandeepmistry recommendation)
+- Scan interference: `hciconfig hci0 up` triggers lingering scan; `LE Set Scan Enable`
+  (disable) must be sent before `LE Create Connection`
+- Connection parameter tuning: 50-70ms interval + 20s timeout (matching working
+  bleno#225 btmon trace); original 18.75ms was too aggressive
+- **Root cause:** Kernel 6.12.56 mgmt layer claims hci0 at boot; even with
+  `bluetooth.service` masked, the in-kernel mgmt holds a reference that blocks
+  HCI_CHANNEL_USER event delivery
+- **Solution:** Kernel parameter `bluetooth.disable_mgmt=1` in `/flash/cmdline.txt`
+  disables the in-kernel mgmt layer, allowing HCI_CHANNEL_RAW to operate without
+  `LE Read Remote Used Features` interference
+- Reboot required for kernel parameter to take effect
+
+### External References
+
+- **[bleno#225](https://github.com/noble/bleno/issues/225):** HCI_CHANNEL_USER usage
+  pattern, btmon traces of successful BLE bonding, SMP flow analysis
+- **[NXP SMP Pairing](https://community.nxp.com/t5/Wireless-MCU/Bluetooth-Low-Energy-SMP-Pairing/m-p/376931):**
+  BLE SMP protocol reference — confirms normal connection flow (no
+  `LE Read Remote Used Features` in standard pairing)
+- **[RPI_Bluetooth](https://github.com/Akashem06/RPI_Bluetooth):** Validates raw-HCI
+  host layer approach on Raspberry Pi 4
+
 ## Operational Notes
 
 - **bluetoothd must be stopped** before running the daemon. Raw HCI requires

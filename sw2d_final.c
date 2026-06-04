@@ -417,6 +417,21 @@ static int hci_user_open(void)
             close(fd);
             return -1;
         }
+        /* HCI_CHANNEL_RAW: bring hci0 up if needed */
+        int dev_id = hci_devid("hci0");
+        if (dev_id >= 0) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "hciconfig hci0 up 2>/dev/null");
+            system(cmd);
+        }
+    } else {
+        /* HCI_CHANNEL_USER: device must be DOWN before bind, bring it UP now */
+        int dev_id = hci_devid("hci0");
+        if (dev_id >= 0) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "hciconfig hci0 up 2>/dev/null");
+            system(cmd);
+        }
     }
     return fd;
 }
@@ -1033,20 +1048,34 @@ static int run_session(const bdaddr_t *peer, uint8_t peer_type, uint8_t own_type
         return -1;
     }
 
+    /* 1b. Stop any lingering scan (hciconfig up may have started one) */
+    fprintf(stderr, "stopping any lingering scan...\n");
+    {
+        uint8_t scan_disable[] = {0x00, 0x00}; /* LE_Set_Scan_Enable disable */
+        raw_hci_send_cmd(dd, OGF_LE_CTL, 0x000C, scan_disable, 2);
+        /* wait for command complete */
+        uint8_t buf[256];
+        for (int i = 0; i < 10; i++) {
+            int n = hci_read_packet(dd, buf, sizeof(buf), 100);
+            if (n > 0 && buf[0] == HCI_EVENT_PKT && buf[1] == EVT_CMD_COMPLETE)
+                break;
+        }
+    }
+
     /* 2. LE Create Connection */
     fprintf(stderr, "creating LE connection to %s (peer_type=%s own_type=%s)...\n",
             peer_txt, addr_type_str(peer_type), addr_type_str(own_type));
     {
         int ret = hci_le_create_conn_raw(dd,
-                                0x0004,    /* scan_interval   */
-                                0x0004,    /* scan_window     */
+                                0x0010,    /* scan_interval (16 * 0.625ms = 10ms) */
+                                0x0010,    /* scan_window   */
                                 peer_type, /* peer_bdaddr_type */
                                 peer,      /* peer BD_ADDR    */
                                 own_type,  /* own_bdaddr_type */
-                                0x000F,    /* conn_interval_min (15 * 1.25ms = 18.75ms) */
-                                0x000F,    /* conn_interval_max */
+                                0x0028,    /* conn_interval_min (40 * 1.25ms = 50ms) */
+                                0x0038,    /* conn_interval_max (56 * 1.25ms = 70ms) */
                                 0,         /* latency         */
-                                0x0C80,    /* supervision_timeout (3200 * 10ms) */
+                                0x07D0,    /* supervision_timeout (2000 * 10ms = 20s) */
                                 0x0001,    /* min_ce_length   */
                                 0x0001,    /* max_ce_length   */
                                 6000);     /* timeout ms      */
@@ -1059,11 +1088,8 @@ static int run_session(const bdaddr_t *peer, uint8_t peer_type, uint8_t own_type
     }
     fprintf(stderr, "connected: handle=0x%04x\n", handle);
 
-    /* 3. Set runtime filter for ACL + events */
-    if (set_acl_runtime_filter(dd) < 0) {
-        close(dd);
-        return -1;
-    }
+    /* 3. Set runtime filter for ACL + events (only needed for HCI_CHANNEL_RAW) */
+    set_acl_runtime_filter(dd);  /* ignore errors — HCI_CHANNEL_USER rejects filters */
 
     /* 4. Request faster connection update (7.5ms) */
     /* skip conn update for now — test if it corrupts fd state */
