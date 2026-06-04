@@ -109,8 +109,16 @@ def parse_manufacturer_raw(data: bytes) -> dict:
     if len(data) >= 16:
         result["vendor_id"] = decodeu(data[3:5])
         result["product_id"] = decodeu(data[5:7])
-        result["reconnect_mac"] = decodeu(data[10:16])
+        result["reconnect_mac"] = data[10:16]
     return result
+
+def reconnect_mac_to_str(value: Optional[bytes]) -> str:
+    """Format reconnect MAC bytes from the manufacturer payload."""
+    if not value:
+        return "unknown"
+    if value == bytes(6):
+        return "00:00:00:00:00:00"
+    return value.hex(":")
 
 def get_pid_name(pid: int) -> str:
     """Human-readable name for Switch 2 product IDs."""
@@ -210,11 +218,16 @@ class ProbeSession:
                 return
 
             info = parse_manufacturer_raw(mfg_data)
+            if (info.get("vendor_id") != NINTENDO_VENDOR_ID or
+                    info.get("product_id") != PRO_CONTROLLER2_PID):
+                return
+
             pid = info.get("product_id")
             pid_str = get_pid_name(pid) if pid else "unknown"
 
             self._log(f"  FOUND: {device.address} ({pid_str}) "
                       f"rssi={adv.rssi} name={device.name} "
+                      f"reconnect_mac={reconnect_mac_to_str(info.get('reconnect_mac'))} "
                       f"mfg_data={hexdump(mfg_data)}")
 
             if not found_device:

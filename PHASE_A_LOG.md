@@ -4,7 +4,7 @@
 
 ✅ **Scan successful**: Controller E0:EF:BF:3B:C6:76 found with Nintendo manufacturer 0x0553  
 ✅ **PID confirmed**: 0x2069 = Pro Controller 2  
-✅ **Manufacturer data decode correct**: vendor=0x057E, reconnect_mac=0 (unpaired)  
+✅ **Manufacturer data decode correct**: vendor=0x057E, product=0x2069
 ❌ **Connect failed**: BlueZ on crackberry (RPi4) kills BLE connection immediately (`le-connection-abort-by-local`)  
 
 ## Key Observations
@@ -15,7 +15,7 @@ Hex: 01 00 03 7e 05 69 20 00 01 00 31 f8 94 55 e2 98 0f 00 00 00 00 00 00 00
 Parse:
   bytes[3:5]  = 0x057E  → Nintendo Vendor ID ✅
   bytes[5:7]  = 0x2069  → Pro Controller 2 PID ✅
-  bytes[10:16] = 0      → reconnect_mac (new pairing needed)
+  bytes[10:16] = 31 f8 94 55 e2 98 → reconnect_mac field is non-zero
 ```
 
 ### BlueZ Interference
@@ -28,7 +28,8 @@ The kernel/BlueZ stack on crackberry (standard Raspbian) immediately drops the B
 - Controller does NOT advertise in normal state
 - Long press Sync button (recessed, top edge) → Player LEDs flash → BLE advertising starts
 - Advertising stops after ~10-15 seconds if not connected
-- Reconnect MAC = 0 means controller is in "new pairing" mode
+- Reconnect MAC field was non-zero in this capture; do not treat this log as
+  proof of a fresh/unpaired state
 
 ## Exit Codes
 

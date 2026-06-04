@@ -793,13 +793,14 @@ int main(int argc, char **argv) {
                     for (int di = 0; di + 2 < dlen;) {
                         uint8_t el = rep[9 + di], ty = rep[10 + di];
                         if (!el || di + 1 + (int)el > dlen) break;
-                        if (ty == 0xFF && el >= 3) {
+                        if (ty == 0xFF && el >= 7) {
                             uint16_t cid = rep[11+di] | (rep[12+di] << 8);
-                            /* Nintendo: 0x0553 (Switch 2) or 0x057E (classic) */
-                            if (cid == 0x0553 || cid == 0x057E) {
+                            uint16_t vid = rep[13+di] | (rep[14+di] << 8);
+                            uint16_t pid = rep[15+di] | (rep[16+di] << 8);
+                            if (cid == 0x0553 && vid == 0x057E && pid == 0x2069) {
                                 char a[18]; ba2str((bdaddr_t *)peer, a);
-                                fprintf(stderr, "  Found: %s type=%s (Nintendo cid=0x%04x)\n",
-                                        a, addr_type_name(atype), cid);
+                                fprintf(stderr, "  Found: %s type=%s (Nintendo cid=0x%04x vid=0x%04x pid=0x%04x)\n",
+                                        a, addr_type_name(atype), cid, vid, pid);
                                 peer_type = atype;
                                 found = 1;
                                 break;
