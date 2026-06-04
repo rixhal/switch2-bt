@@ -1,18 +1,19 @@
 /* sw2d_final.c — Switch 2 Pro Controller Raw-HCI BLE Daemon (Golden Path)
  *
- * Architecture:
- *   Two-socket HCI (cmd_fd + rx_fd) with complete RX filter
- *   Integrated RX demux dispatching HCI_EVENT_PKT / HCI_ACLDATA_PKT
+ * Architecture (v3 — HCI_CHANNEL_USER):
+ *   Single HCI_CHANNEL_USER socket — direct controller access
+ *   No kernel interference, no HCI filter, no MGMT contamination
+ *   hci0 DOWN → bind USER channel → exclusive controller ownership
+ *   Proven SMP Golden Path (c1/s1, Confirm/Random, STK, Encryption)
  *   Hard state machine: ATT blocked until ENCRYPTED
- *   SMP golden-path replay from previously successful pairing
  *   USB prep with auto host BDADDR
  *   Peer address type auto-detection
- *   BlueZ/MGMT ownership guard
  *
  * Build: gcc -O2 -s -Wall -o sw2d_final sw2d_final.c -lbluetooth -lcrypto
  *
- * Commits 2-9: rx-demux, hci-init, two-socket, ownership, addr-type, host-bdaddr,
- *              smp-replay, att-gate
+ * Reference: BlueKitchen BTstack platform/linux/hci_transport_linux.c
+ *   HCI_CHANNEL_USER gives direct, unfiltered controller access when
+ *   hci0 is DOWN — no kernel commands leak in, no MGMT contamination.
  */
 
 #define _GNU_SOURCE
@@ -36,7 +37,7 @@
 #include <bluetooth/hci_lib.h>
 #include <openssl/evp.h>
 
-/* ── constants ─────────────────────────────────────────────────────────── */
+/* ═══ constants ═══════════════════════════════════════════════════════════ */
 #define HCI_COMMAND_PKT  0x01
 #define HCI_ACLDATA_PKT  0x02
 #define HCI_EVENT_PKT    0x04
@@ -52,6 +53,7 @@
 #define EVT_LE_ADV_REPORT         0x02
 #define EVT_LE_DATA_LEN_CHANGE    0x07
 #define EVT_ENCRYPT_KEY_REFRESH   0x30
+#define EVT_LE_LTK_REQUEST        0x05
 
 #define OGF_LE_CTL         0x08
 #define OCF_LE_SET_EVENT_MASK    0x0001
@@ -88,7 +90,7 @@
 #define SMP_OP_IDENT_ADDR_INFO    0x09
 #define SMP_OP_SECURITY_REQUEST   0x0b
 
-/* ── state machine ─────────────────────────────────────────────────────── */
+/* ═══ state machine ══════════════════════════════════════════════════════ */
 typedef enum {
     STATE_DISCONNECTED,
     STATE_CONNECTED_UNENCRYPTED,
@@ -118,10 +120,9 @@ static const char *state_name(session_state_t s) {
     }
 }
 
-/* ── session context ───────────────────────────────────────────────────── */
+/* ═══ session context ════════════════════════════════════════════════════ */
 typedef struct {
-    int      rx_fd;
-    int      cmd_fd;
+    int      hci_fd;        /* single HCI_CHANNEL_USER socket */
     uint16_t conn_handle;
     session_state_t state;
     int      verbose;
@@ -149,13 +150,15 @@ typedef struct {
     uint8_t  notify_data[256];
     uint16_t notify_len;
     uint16_t notify_handle;
+    /* disconnect tracking */
+    uint8_t  last_disconnect_reason;
 } session_t;
 
-/* ── globals ───────────────────────────────────────────────────────────── */
+/* ═══ globals ════════════════════════════════════════════════════════════ */
 static volatile sig_atomic_t g_running = 1;
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
-/* ── helpers ───────────────────────────────────────────────────────────── */
+/* ═══ helpers ════════════════════════════════════════════════════════════ */
 static uint16_t get_le16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static void put_le16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 
@@ -165,122 +168,142 @@ static int64_t now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* ── HCI command send via writev ───────────────────────────────────────── */
-static int raw_send_cmd(int fd, uint16_t ogf, uint16_t ocf, const uint8_t *params, uint8_t plen) {
+static void hexdump(const char *label, const uint8_t *data, int len) {
+    fprintf(stderr, "  %s (%d): ", label, len);
+    for (int i = 0; i < len && i < 32; i++) fprintf(stderr, "%02x ", data[i]);
+    if (len > 32) fprintf(stderr, "...");
+    fprintf(stderr, "\n");
+}
+
+/* ═══ read BDADDR from /sys (works when hci0 is DOWN) ════════════════════ */
+static int read_local_bdaddr(uint8_t out[6]) {
+    FILE *f = fopen("/sys/class/bluetooth/hci0/address", "r");
+    if (!f) return -1;
+    char line[32];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    fclose(f);
+    line[strcspn(line, "\n")] = 0;
+    unsigned int b[6];
+    if (sscanf(line, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &b[5], &b[4], &b[3], &b[2], &b[1], &b[0]) == 6) {
+        for (int i = 0; i < 6; i++) out[i] = (uint8_t)b[i];
+        return 0;
+    }
+    return -1;
+}
+
+/* ═══ HCI_CHANNEL_USER socket ════════════════════════════════════════════ */
+static int open_hci_user_socket(void) {
+    /* hci0 must be DOWN for HCI_CHANNEL_USER */
+    system("hciconfig hci0 down 2>/dev/null");
+    usleep(200000);
+
+    int fd = socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC, BTPROTO_HCI);
+    if (fd < 0) { perror("hci_user socket"); return -1; }
+
+    struct sockaddr_hci addr = {
+        .hci_family = AF_BLUETOOTH,
+        .hci_dev    = 0,
+        .hci_channel = HCI_CHANNEL_USER,
+    };
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("hci_user bind (is hci0 DOWN? is bluetoothd stopped?)");
+        close(fd);
+        return -1;
+    }
+    fprintf(stderr, "  HCI_CHANNEL_USER socket open (fd=%d, exclusive controller access)\n", fd);
+    return fd;
+}
+
+/* ═══ HCI command send ═══════════════════════════════════════════════════ */
+static int hci_send_cmd_(int fd, uint16_t ogf, uint16_t ocf,
+                         const uint8_t *params, uint8_t plen) {
     uint8_t pkt_type = HCI_COMMAND_PKT;
     uint8_t hdr[3];
     uint16_t opcode = (uint16_t)((ocf & 0x03ff) | (ogf << 10));
     put_le16(hdr, opcode);
     hdr[2] = plen;
-    struct iovec iov[3] = {{&pkt_type, 1}, {hdr, 3}, {(void*)params, plen}};
-    ssize_t n = writev(fd, iov, 3);
+    struct iovec iov[3] = {
+        {&pkt_type, 1},
+        {hdr, 3},
+        {(void *)params, plen},
+    };
+    ssize_t n = writev(fd, iov, params ? 3 : 2);
     if (n < 0) { perror("writev HCI cmd"); return -1; }
     return 0;
 }
 
-/* ── two-socket HCI setup ──────────────────────────────────────────────── */
-static int open_cmd_socket(void) {
-    int fd = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
-    if (fd < 0) { perror("cmd socket"); return -1; }
-    struct sockaddr_hci addr = {.hci_family = AF_BLUETOOTH, .hci_dev = 0, .hci_channel = HCI_CHANNEL_RAW};
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("cmd bind"); close(fd); return -1; }
-    return fd;
-}
-
-static int open_rx_socket(void) {
-    int fd = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
-    if (fd < 0) { perror("rx socket"); return -1; }
-    struct sockaddr_hci addr = {.hci_family = AF_BLUETOOTH, .hci_dev = 0, .hci_channel = HCI_CHANNEL_RAW};
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("rx bind"); close(fd); return -1; }
-    /* Complete RX filter */
-    struct hci_filter f;
-    hci_filter_clear(&f);
-    hci_filter_set_ptype(HCI_EVENT_PKT, &f);
-    hci_filter_set_ptype(HCI_ACLDATA_PKT, &f);
-    hci_filter_set_event(EVT_CMD_COMPLETE, &f);
-    hci_filter_set_event(EVT_CMD_STATUS, &f);
-    hci_filter_set_event(EVT_LE_META, &f);
-    hci_filter_set_event(EVT_DISCONN_COMPLETE, &f);
-    hci_filter_set_event(EVT_NUM_COMP_PKTS, &f);
-    hci_filter_set_event(EVT_ENCRYPT_CHANGE, &f);
-    hci_filter_set_event(EVT_ENCRYPT_KEY_REFRESH, &f);
-    if (setsockopt(fd, SOL_HCI, HCI_FILTER, &f, sizeof(f)) < 0) { perror("rx filter"); close(fd); return -1; }
-    return fd;
-}
-
-/* ── HCI init sequence ─────────────────────────────────────────────────── */
-static int hci_init_sequence(int cmd_fd) {
+/* ═══ HCI init sequence ══════════════════════════════════════════════════ */
+static int hci_init_sequence(int fd) {
     fprintf(stderr, "=== HCI Init ===\n");
     /* HCI_Reset */
-    if (raw_send_cmd(cmd_fd, 0x03, 0x0003, NULL, 0) < 0) return -1;
+    if (hci_send_cmd_(fd, 0x03, 0x0003, NULL, 0) < 0) return -1;
     fprintf(stderr, "  HCI_Reset sent\n");
-    usleep(100000);
+    usleep(50000);
+
     /* LE Set Event Mask */
     uint8_t evtmask[8] = {0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00};
-    if (raw_send_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_SET_EVENT_MASK, evtmask, 8) < 0) return -1;
+    if (hci_send_cmd_(fd, OGF_LE_CTL, OCF_LE_SET_EVENT_MASK, evtmask, 8) < 0)
+        return -1;
     fprintf(stderr, "  LE_Set_Event_Mask sent\n");
+    usleep(50000);
     return 0;
 }
 
-/* ── BlueZ ownership guard ──────────────────────────────────────────────── */
-static int check_bluez_clients(void) {
-    int count = 0;
-    DIR *d = opendir("/proc");
-    if (!d) return -1;
-    struct dirent *ent;
-    while ((ent = readdir(d))) {
-        if (ent->d_type != DT_DIR) continue;
-        char path[256], buf[256];
-        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
-        FILE *f = fopen(path, "r");
-        if (!f) continue;
-        if (fgets(buf, sizeof(buf), f)) {
-            buf[strcspn(buf, "\n")] = 0;
-            if (!strcmp(buf, "bluetoothd") || !strcmp(buf, "bluetoothctl") ||
-                !strcmp(buf, "btmgmt") || !strcmp(buf, "gatttool") ||
-                !strcmp(buf, "hcitool") || strstr(buf, "python") || strstr(buf, "bleak")) {
-                fprintf(stderr, "  CONFLICT: %s (pid=%s)\n", buf, ent->d_name);
-                count++;
-            }
-        }
-        fclose(f);
-    }
-    closedir(d);
-    return count;
+/* ═══ ACL send ═══════════════════════════════════════════════════════════ */
+static int acl_send(int fd, uint16_t handle, uint16_t cid,
+                    const uint8_t *data, uint16_t len) {
+    uint8_t buf[5 + 4 + 512];
+    uint16_t hf = (uint16_t)((handle & 0x0fff) | (2u << 12)); /* PB=start */
+    uint16_t acl_len = (uint16_t)(4 + len);
+    buf[0] = HCI_ACLDATA_PKT;
+    put_le16(buf + 1, hf);
+    put_le16(buf + 3, acl_len);
+    put_le16(buf + 5, len);
+    put_le16(buf + 7, cid);
+    if (len > 512) return -1;
+    memcpy(buf + 9, data, len);
+    struct iovec iov[1] = {{buf, 9u + len}};
+    ssize_t n = writev(fd, iov, 1);
+    if (n < 0) { perror("acl_send"); return -1; }
+    return 0;
 }
 
-static void kill_bluez_clients(void) {
-    system("killall -9 bluetoothd bluetoothctl btmgmt gatttool hcitool 2>/dev/null");
-    system("systemctl stop bluetooth 2>/dev/null");
-    usleep(500000);
+static int smp_send(session_t *s, const uint8_t *data, uint16_t len) {
+    return acl_send(s->hci_fd, s->conn_handle, SMP_CID, data, len);
 }
 
-/* ── LE Create Connection ──────────────────────────────────────────────── */
-static int le_create_conn(int cmd_fd, const uint8_t peer[6], uint8_t peer_type,
-                          uint8_t own_type, uint16_t *handle) {
+static int att_send(session_t *s, const uint8_t *data, uint16_t len) {
+    return acl_send(s->hci_fd, s->conn_handle, ATT_CID, data, len);
+}
+
+/* ═══ LE Create Connection ═══════════════════════════════════════════════ */
+static int le_create_conn(session_t *s) {
     uint8_t p[25];
-    put_le16(p+0, 0x0010); /* scan interval */
-    put_le16(p+2, 0x0010); /* scan window */
-    p[4] = 0x00;           /* filter: 0 = no whitelist */
-    p[5] = peer_type;      /* peer addr type */
-    memcpy(p+6, peer, 6);  /* peer addr (LE byte order) */
-    p[12] = own_type;      /* own addr type */
-    put_le16(p+13, 0x000C); /* conn interval min (15ms) */
-    put_le16(p+15, 0x000C); /* conn interval max */
-    put_le16(p+17, 0x0000); /* latency */
-    put_le16(p+19, 0x0C80); /* supervision timeout */
-    put_le16(p+21, 0x0001); /* min CE length */
-    put_le16(p+23, 0x0001); /* max CE length */
-    if (raw_send_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_CREATE_CONN, p, sizeof(p)) < 0) return -1;
+    put_le16(p + 0, 0x0010);  /* scan interval (10ms) */
+    put_le16(p + 2, 0x0010);  /* scan window (10ms) */
+    p[4] = 0x00;               /* filter: no whitelist */
+    p[5] = s->peer_addr_type;
+    memcpy(p + 6, s->peer_addr, 6);
+    p[12] = s->local_addr_type;
+    put_le16(p + 13, 0x000C);  /* conn interval min (15ms) */
+    put_le16(p + 15, 0x000C);  /* conn interval max (15ms) */
+    put_le16(p + 17, 0x0000);  /* latency */
+    put_le16(p + 19, 0x0C80);  /* supervision timeout (3.2s) */
+    put_le16(p + 21, 0x0001);  /* min CE */
+    put_le16(p + 23, 0x0001);  /* max CE */
+    if (hci_send_cmd_(s->hci_fd, OGF_LE_CTL, OCF_LE_CREATE_CONN, p, 25) < 0)
+        return -1;
     fprintf(stderr, "  LE_Create_Connection: peer=%02x:%02x:%02x:%02x:%02x:%02x type=%s\n",
-            peer[5], peer[4], peer[3], peer[2], peer[1], peer[0],
-            peer_type == 0x01 ? "random" : "public");
-    *handle = 0;
+            s->peer_addr[5], s->peer_addr[4], s->peer_addr[3],
+            s->peer_addr[2], s->peer_addr[1], s->peer_addr[0],
+            s->peer_addr_type == LE_RANDOM_ADDRESS ? "random" : "public");
     return 0;
 }
 
-/* ── SMP: AES-128 via OpenSSL ──────────────────────────────────────────── */
-static int aes_128(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+/* ═══ SMP: AES-128 via OpenSSL ═══════════════════════════════════════════ */
+static int aes_128(const uint8_t key[16], const uint8_t in[16],
+                   uint8_t out[16]) {
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
     int ol = 0, tl = 0;
     EVP_EncryptInit_ex(c, EVP_aes_128_ecb(), NULL, key, NULL);
@@ -291,79 +314,41 @@ static int aes_128(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
     return 0;
 }
 
-/* SMP s1: STK derivation */
-static void smp_s1(const uint8_t k[16], const uint8_t r1[16], const uint8_t r2[16], uint8_t stk[16]) {
-    uint8_t d[16];
-    memcpy(d, r1, 8);
-    memcpy(d+8, r2, 8);
-    aes_128(k, d, stk);
-}
-
-/* SMP c1: confirm value */
+/* SMP c1: confirm value (BLUETOOTH CORE SPEC 5.4 Vol 3 Part H 2.2.6) */
 static void smp_c1(const uint8_t k[16], const uint8_t r[16],
                    const uint8_t preq[7], const uint8_t pres[7],
                    uint8_t iat, const uint8_t ia[6],
                    uint8_t rat, const uint8_t ra[6],
                    uint8_t confirm[16]) {
     uint8_t p1[16], p2[16], tmp[16];
+    /* p1 = pres || preq || rat || iat */
     memcpy(p1, pres, 7);
-    memcpy(p1+7, preq, 7);
-    p1[14] = rat; p1[15] = iat;
+    memcpy(p1 + 7, preq, 7);
+    p1[14] = rat;
+    p1[15] = iat;
+    /* tmp = r XOR p1 */
     for (int i = 0; i < 16; i++) tmp[i] = r[i] ^ p1[i];
     aes_128(k, tmp, tmp);
+    /* p2 = padding || ia || ra */
     memset(p2, 0, 4);
-    memcpy(p2+4, ia, 6);
-    memcpy(p2+10, ra, 6);
+    memcpy(p2 + 4, ia, 6);
+    memcpy(p2 + 10, ra, 6);
     for (int i = 0; i < 16; i++) tmp[i] ^= p2[i];
     aes_128(k, tmp, confirm);
 }
 
-/* ── SMP: send pairing request (golden path replay) ────────────────────── */
-static int smp_send_pairing_req(int cmd_fd, session_t *s) {
-    /* Golden-path pairing request: IO=NoInputNoOutput, AuthReq=Bonding, MaxKey=16, Just Works */
-    uint8_t req[] = {
-        SMP_OP_PAIRING_REQ,  /* 0x01 */
-        0x03,                /* IO: NoInputNoOutput */
-        0x00,                /* OOB: not present */
-        0x01,                /* AuthReq: Bonding (no MITM, no SC) */
-        0x10,                /* MaxEncKeySize: 16 */
-        0x03,                /* InitiatorKeyDist: EncKey | IdKey */
-        0x03,                /* ResponderKeyDist: EncKey | IdKey */
-    };
-    memcpy(s->smp_preq, req, sizeof(req));
-    return raw_send_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_START_ENCRYPTION, NULL, 0); /* will be ACL */
-}
-
-/* ── ACL Send ──────────────────────────────────────────────────────────── */
-static int acl_send(int cmd_fd, uint16_t handle, uint16_t cid, const uint8_t *data, uint16_t len) {
-    uint8_t buf[5 + 4 + 512];
-    uint16_t hf = (uint16_t)((handle & 0x0fff) | (2u << 12));
-    uint16_t acl_len = (uint16_t)(4 + len);
-    buf[0] = HCI_ACLDATA_PKT;
-    put_le16(buf+1, hf);
-    put_le16(buf+3, acl_len);
-    put_le16(buf+5, len);
-    put_le16(buf+7, cid);
-    if (len > 512) return -1;
-    memcpy(buf+9, data, len);
-    struct iovec iov[1] = {{buf, 9u + len}};
-    ssize_t n = writev(cmd_fd, iov, 1);
-    if (n < 0) { perror("acl_send"); return -1; }
-    return 0;
-}
-
-static int smp_send(int cmd_fd, session_t *s, const uint8_t *data, uint16_t len) {
-    return acl_send(cmd_fd, s->conn_handle, SMP_CID, data, len);
-}
-
-static int att_send(int cmd_fd, session_t *s, const uint8_t *data, uint16_t len) {
-    return acl_send(cmd_fd, s->conn_handle, ATT_CID, data, len);
+/* SMP s1: STK derivation */
+static void smp_s1(const uint8_t k[16], const uint8_t r1[16],
+                   const uint8_t r2[16], uint8_t stk[16]) {
+    uint8_t d[16];
+    memcpy(d, r1, 8);
+    memcpy(d + 8, r2, 8);
+    aes_128(k, d, stk);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * RX-DEMUX: integrated HCI event + ACL dispatcher
+ * RX FRAME — read from single HCI_CHANNEL_USER socket
  * ═══════════════════════════════════════════════════════════════════════════ */
-
 typedef struct {
     uint8_t  pkt_type;
     uint8_t  evt_code;
@@ -381,12 +366,13 @@ typedef struct {
 } hci_frame_t;
 
 static int rx_read_frame(session_t *s, hci_frame_t *f, int timeout_ms) {
-    struct pollfd pfd = {.fd = s->rx_fd, .events = POLLIN};
+    struct pollfd pfd = {.fd = s->hci_fd, .events = POLLIN};
     int pr = poll(&pfd, 1, timeout_ms);
-    if (pr <= 0) return pr;
+    if (pr < 0) return -1;
+    if (pr == 0) return 0;
 
     uint8_t buf[512];
-    int n = (int)read(s->rx_fd, buf, sizeof(buf));
+    ssize_t n = read(s->hci_fd, buf, sizeof(buf));
     if (n < 1) return n < 0 ? -1 : 0;
 
     memcpy(f->raw, buf, (size_t)n);
@@ -396,99 +382,169 @@ static int rx_read_frame(session_t *s, hci_frame_t *f, int timeout_ms) {
     if (buf[0] == HCI_EVENT_PKT && n >= 3) {
         f->evt_code = buf[1];
         f->payload = buf + 3;
-        f->payload_len = buf[2];
-        if (f->evt_code == EVT_LE_META && f->payload_len >= 2) {
+        f->payload_len = (uint16_t)buf[2];
+        if (f->evt_code == EVT_LE_META && f->payload_len >= 2)
             f->subevent = f->payload[0];
-        }
+
         if (f->evt_code == EVT_CMD_STATUS && f->payload_len >= 4) {
             f->status = f->payload[0];
             f->opcode = get_le16(f->payload + 2);
         }
         if (f->evt_code == EVT_DISCONN_COMPLETE && f->payload_len >= 4) {
             f->handle = get_le16(f->payload + 1) & 0x0fff;
-            f->status = f->payload[3];
+            f->status = f->payload[3];  /* reason code */
         }
-        return n;
+        if (f->evt_code == EVT_ENCRYPT_CHANGE && f->payload_len >= 4) {
+            f->status = f->payload[2];  /* 0x00 = success */
+            f->handle = get_le16(f->payload + 0) & 0x0fff;
+        }
+        return 1;
     }
 
     if (buf[0] == HCI_ACLDATA_PKT && n >= 9) {
-        f->handle = get_le16(buf+1) & 0x0fff;
-        f->acl_len = get_le16(buf+3);
-        f->l2cap_len = get_le16(buf+5);
-        f->cid = get_le16(buf+7);
+        f->handle = get_le16(buf + 1) & 0x0fff;
+        f->acl_len = get_le16(buf + 3);
+        f->l2cap_len = get_le16(buf + 5);
+        f->cid = get_le16(buf + 7);
         f->payload = buf + 9;
         f->payload_len = f->l2cap_len;
-        return n;
+        return 1;
     }
 
-    return n;
+    return 1; /* unknown but consumed */
 }
 
-/* rx_await: wait for specific event+subevent, dispatching everything else */
-static int rx_await(session_t *s, uint8_t evt, uint8_t sub, int timeout_ms) {
+/* ═══════════════════════════════════════════════════════════════════════════
+ * RX DEMUX — dispatch and wait for specific events
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* rx_dispatch: read one frame, log + handle global events, return 1=event 2=ACL */
+static int rx_dispatch(session_t *s, hci_frame_t *f, int timeout_ms) {
+    int rc = rx_read_frame(s, f, timeout_ms);
+    if (rc <= 0) return rc;
+
+    if (f->pkt_type == HCI_EVENT_PKT) {
+        if (s->verbose) {
+            const char *names[] = {
+                [EVT_CMD_COMPLETE] = "CMD_COMPLETE",
+                [EVT_CMD_STATUS] = "CMD_STATUS",
+                [EVT_DISCONN_COMPLETE] = "DISCONN_COMPLETE",
+                [EVT_NUM_COMP_PKTS] = "NUM_COMP_PKTS",
+                [EVT_ENCRYPT_CHANGE] = "ENCRYPT_CHANGE",
+                [EVT_LE_META] = "LE_META",
+                [EVT_ENCRYPT_KEY_REFRESH] = "ENCRYPT_KEY_REFRESH",
+            };
+            const char *nm = (f->evt_code < 0x40 && names[f->evt_code])
+                                 ? names[f->evt_code]
+                                 : "?";
+            fprintf(stderr, "  [rx] EVT %s", nm);
+            if (f->evt_code == EVT_CMD_STATUS)
+                fprintf(stderr, " status=0x%02x opcode=0x%04x", f->status,
+                        f->opcode);
+            if (f->evt_code == EVT_LE_META)
+                fprintf(stderr, " sub=0x%02x", f->subevent);
+            if (f->evt_code == EVT_DISCONN_COMPLETE)
+                fprintf(stderr, " handle=0x%04x reason=0x%02x", f->handle,
+                        f->status);
+            if (f->evt_code == EVT_ENCRYPT_CHANGE)
+                fprintf(stderr, " handle=0x%04x status=0x%02x", f->handle,
+                        f->status);
+            fprintf(stderr, "\n");
+        }
+
+        /* Record disconnect reason */
+        if (f->evt_code == EVT_DISCONN_COMPLETE)
+            s->last_disconnect_reason = f->status;
+
+        /* Auto-update encryption state */
+        if (f->evt_code == EVT_ENCRYPT_CHANGE && f->status == 0x00 &&
+            f->handle == s->conn_handle)
+            s->state = STATE_ENCRYPTED;
+
+        return 1; /* event */
+    }
+
+    if (f->pkt_type == HCI_ACLDATA_PKT) {
+        if (s->verbose && f->cid != ATT_CID)
+            fprintf(stderr, "  [rx] ACL handle=0x%04x cid=0x%04x len=%u\n",
+                    f->handle, f->cid, f->payload_len);
+        /* Buffer ATT notifications */
+        if (f->handle == s->conn_handle && f->cid == ATT_CID &&
+            f->payload_len >= 1 && f->payload[0] == ATT_OP_HANDLE_NOTIFY &&
+            f->payload_len >= 3) {
+            s->notify_handle = get_le16(f->payload + 1);
+            s->notify_len = f->payload_len - 3;
+            if (s->notify_len <= sizeof(s->notify_data))
+                memcpy(s->notify_data, f->payload + 3, s->notify_len);
+            return 3; /* notification */
+        }
+        return 2; /* ACL */
+    }
+
+    return 1;
+}
+
+/*
+ * rx_await: wait for specific event pattern, return 0=got_it, -1=timeout,
+ * -2=disconnect
+ */
+static int rx_await(session_t *s, uint8_t evt, uint8_t sub,
+                    uint8_t *out_data, uint16_t *out_len,
+                    int timeout_ms) {
     int64_t deadline = now_ms() + timeout_ms;
     hci_frame_t f;
 
     while (g_running) {
         int64_t rem = deadline - now_ms();
         if (rem <= 0) {
-            fprintf(stderr, "  [rx] await timeout for evt=0x%02x sub=0x%02x\n", evt, sub);
+            fprintf(stderr, "  [rx] await timeout evt=0x%02x sub=0x%02x\n",
+                    evt, sub);
             return -1;
         }
-        int n = rx_read_frame(s, &f, (int)(rem > 1000 ? 1000 : rem));
-        if (n <= 0) continue;
+        int rc = rx_read_frame(s, &f, (int)(rem > 500 ? 500 : rem));
+        if (rc <= 0) continue;
 
         if (f.pkt_type == HCI_EVENT_PKT) {
-            /* Dispatch by event type */
+            /* Always handle disconnects */
             if (f.evt_code == EVT_DISCONN_COMPLETE) {
+                s->last_disconnect_reason = f.status;
                 fprintf(stderr, "  [rx] DISCONNECT handle=0x%04x reason=0x%02x\n",
                         f.handle, f.status);
                 return -2;
             }
+            /* CMD_STATUS for our commands */
             if (f.evt_code == EVT_CMD_STATUS) {
-                if (s->verbose) fprintf(stderr, "  [rx] CMD_STATUS status=0x%02x opcode=0x%04x\n",
-                                        f.status, f.opcode);
+                if (s->verbose)
+                    fprintf(stderr, "  [rx] CMD_STATUS status=0x%02x opcode=0x%04x\n",
+                            f.status, f.opcode);
             }
-            if (f.evt_code == EVT_ENCRYPT_CHANGE && f.payload_len >= 4) {
-                uint8_t st = f.payload[2];
-                fprintf(stderr, "  [rx] ENCRYPT_CHANGE status=0x%02x handle=0x%04x\n",
-                        st, get_le16(f.payload+0) & 0x0fff);
-                if (st == 0x00) s->state = STATE_ENCRYPTED;
+            /* Auto-detect encryption success */
+            if (f.evt_code == EVT_ENCRYPT_CHANGE && f.status == 0x00 &&
+                f.handle == s->conn_handle) {
+                s->state = STATE_ENCRYPTED;
+                fprintf(stderr, "  [rx] ENCRYPT_CHANGE success ✓\n");
             }
-            if (f.evt_code == EVT_LE_META) {
-                if (f.subevent == EVT_LE_CONN_COMPLETE && f.payload_len >= 18) {
-                    uint16_t h = get_le16(f.payload+3) & 0x0fff;
-                    uint8_t st = f.payload[1];
-                    fprintf(stderr, "  [rx] LE_CONN_COMPLETE status=0x%02x handle=0x%04x interval=%u\n",
-                            st, h, get_le16(f.payload+14));
-                    if (st == 0x00) s->conn_handle = h;
+            /* Extract conn_handle from LE Connection Complete */
+            if (f.evt_code == EVT_LE_META && f.subevent == EVT_LE_CONN_COMPLETE &&
+                f.payload_len >= 18 && f.payload[1] == 0x00) {
+                s->conn_handle = get_le16(f.payload + 3) & 0x0fff;
+                fprintf(stderr, "  [rx] LE_CONN_COMPLETE handle=0x%04x interval=%.2fms\n",
+                        s->conn_handle, get_le16(f.payload + 14) * 1.25);
+            }
+            /* Check if this matches our awaited event */
+            int match = 0;
+            if (evt == EVT_LE_META)
+                match = (f.evt_code == EVT_LE_META && f.subevent == sub);
+            else
+                match = (f.evt_code == evt);
+            if (match) {
+                if (out_data && f.payload_len > 0) {
+                    size_t cp =
+                        f.payload_len < *out_len ? f.payload_len : *out_len;
+                    memcpy(out_data, f.payload, cp);
+                    *out_len = (uint16_t)cp;
                 }
-                if (f.subevent == EVT_LE_CONN_UPDATE && f.payload_len >= 9) {
-                    fprintf(stderr, "  [rx] LE_CONN_UPDATE status=0x%02x interval=%u\n",
-                            f.payload[1], get_le16(f.payload+5));
-                }
-            }
-            /* Check if this is our awaited event */
-            if (f.evt_code == evt && (sub == 0 || (f.evt_code == EVT_LE_META && f.subevent == sub))) {
-                return 1;
-            }
-            continue;
-        }
-
-        if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s->conn_handle) {
-            if (f.cid == ATT_CID) {
-                /* Buffer notification for ATT handler */
-                if (f.payload_len < sizeof(s->notify_data) && f.payload_len > 0 &&
-                    f.payload[0] == ATT_OP_HANDLE_NOTIFY) {
-                    s->notify_handle = get_le16(f.payload+1);
-                    s->notify_len = f.payload_len - 3;
-                    memcpy(s->notify_data, f.payload+3, s->notify_len);
-                    return 1; /* notification ready */
-                }
-            }
-            if (s->verbose) {
-                fprintf(stderr, "  [rx] ACL handle=0x%04x cid=0x%04x len=%u\n",
-                        f.handle, f.cid, f.payload_len);
+                return 0;
             }
             continue;
         }
@@ -496,192 +552,219 @@ static int rx_await(session_t *s, uint8_t evt, uint8_t sub, int timeout_ms) {
     return -1;
 }
 
-/* rx_await_att: wait for ATT response (specific opcode) */
-static int rx_await_att(session_t *s, uint8_t expect_op, uint8_t *out, size_t outsz,
-                        int timeout_ms) {
+/*
+ * rx_await_acl: wait for ACL data on specific CID, return 0=got_it,
+ * -1=timeout, -2=disconnect
+ */
+static int rx_await_acl(session_t *s, uint16_t cid, uint8_t *out,
+                        uint16_t *out_len, int timeout_ms) {
     int64_t deadline = now_ms() + timeout_ms;
+    hci_frame_t f;
+
     while (g_running) {
         int64_t rem = deadline - now_ms();
         if (rem <= 0) return -1;
-        int rc = rx_await(s, EVT_LE_META, 0, (int)(rem > 1000 ? 1000 : rem));
-        if (rc == -2) return -2; /* disconnect */
-        if (rc == 1) {
-            /* Got a notification or event — check if it's ATT */
-            if (s->notify_len > 0) {
-                if (out && outsz >= s->notify_len + 3) {
-                    out[0] = ATT_OP_HANDLE_NOTIFY;
-                    put_le16(out+1, s->notify_handle);
-                    memcpy(out+3, s->notify_data, s->notify_len);
-                    return (int)(s->notify_len + 3);
-                }
-                return (int)s->notify_len + 3;
+
+        int rc = rx_read_frame(s, &f, (int)(rem > 500 ? 500 : rem));
+        if (rc <= 0) continue;
+
+        if (f.pkt_type == HCI_EVENT_PKT) {
+            if (f.evt_code == EVT_DISCONN_COMPLETE) {
+                s->last_disconnect_reason = f.status;
+                fprintf(stderr, "  [rx] DISCONNECT reason=0x%02x\n",
+                        f.status);
+                return -2;
             }
+            if (f.evt_code == EVT_ENCRYPT_CHANGE && f.status == 0x00)
+                s->state = STATE_ENCRYPTED;
+            if (s->verbose)
+                fprintf(stderr, "  [rx] %s while waiting for ACL\n",
+                        f.evt_code == EVT_LE_META ? "LE_META" : "EVENT");
+            continue;
+        }
+
+        if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s->conn_handle &&
+            f.cid == cid) {
+            if (out && out_len && f.payload_len <= *out_len) {
+                memcpy(out, f.payload, f.payload_len);
+                *out_len = f.payload_len;
+            }
+            return 0;
         }
     }
     return -1;
 }
 
-/* ── USB prep with auto host BDADDR ────────────────────────────────────── */
+/* ═══ USB prep with auto host BDADDR ══════════════════════════════════════ */
 static int usb_prep(const char *hidraw, const uint8_t host[6]) {
     int fd = open(hidraw, O_RDWR);
-    if (fd < 0) { perror(hidraw); return -1; }
+    if (fd < 0) {
+        perror(hidraw);
+        return -1;
+    }
 
     uint8_t r[64];
+
     /* SetHCIState */
     memset(r, 0, sizeof(r));
-    r[0] = 0x01; r[1] = 0x01; r[10] = 0x06; r[11] = 0x01;
-    if (write(fd, r, sizeof(r)) < 0) { perror("SetHCIState"); close(fd); return -1; }
+    r[0] = 0x01;
+    r[1] = 0x01;
+    r[10] = 0x06;
+    r[11] = 0x01;
+    if (write(fd, r, sizeof(r)) < 0) {
+        perror("SetHCIState");
+        close(fd);
+        return -1;
+    }
     fprintf(stderr, "  SetHCIState sent\n");
 
     /* SetShipment */
     memset(r, 0, sizeof(r));
-    r[0] = 0x01; r[1] = 0x02; r[10] = 0x08; r[11] = 0x00;
-    if (write(fd, r, sizeof(r)) < 0) { perror("SetShipment"); close(fd); return -1; }
+    r[0] = 0x01;
+    r[1] = 0x02;
+    r[10] = 0x08;
+    r[11] = 0x00;
+    if (write(fd, r, sizeof(r)) < 0) {
+        perror("SetShipment");
+        close(fd);
+        return -1;
+    }
     fprintf(stderr, "  SetShipment sent\n");
 
     /* BluetoothManualPair */
     memset(r, 0, sizeof(r));
-    r[0] = 0x01; r[1] = 0x03; r[10] = 0x01;
-    memcpy(r+11, host, 6);
-    if (write(fd, r, sizeof(r)) < 0) { perror("BluetoothManualPair"); close(fd); return -1; }
-    fprintf(stderr, "  BluetoothManualPair (host=%02x:%02x:%02x:%02x:%02x:%02x)\n",
+    r[0] = 0x01;
+    r[1] = 0x03;
+    r[10] = 0x01;
+    memcpy(r + 11, host, 6);
+    if (write(fd, r, sizeof(r)) < 0) {
+        perror("BluetoothManualPair");
+        close(fd);
+        return -1;
+    }
+    fprintf(stderr,
+            "  BluetoothManualPair "
+            "(host=%02x:%02x:%02x:%02x:%02x:%02x)\n",
             host[5], host[4], host[3], host[2], host[1], host[0]);
     close(fd);
     return 0;
 }
 
-/* ── Peer address auto-detection via raw HCI scan ──────────────────────── */
-static int scan_peer(int dev_id, uint8_t peer[6], uint8_t *peer_type, int timeout_ms) {
-    int fd = hci_open_dev(dev_id);
-    if (fd < 0) { perror("scan: hci_open_dev"); return -1; }
-
-    struct hci_filter of, nf;
-    socklen_t flen = sizeof(of);
-    getsockopt(fd, SOL_HCI, HCI_FILTER, &of, &flen);
-    hci_filter_clear(&nf);
-    hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
-    hci_filter_set_event(EVT_LE_META, &nf);
-    setsockopt(fd, SOL_HCI, HCI_FILTER, &nf, sizeof(nf));
-
-    if (hci_le_set_scan_parameters(fd, 0x01, 0x0010, 0x0010, LE_PUBLIC_ADDRESS, 0x00, 1000) < 0) {
-        perror("scan params"); goto done;
-    }
-    if (hci_le_set_scan_enable(fd, 0x01, 0x00, 1000) < 0) {
-        perror("scan enable"); goto done;
-    }
-
-    fprintf(stderr, "=== Scanning for Nintendo (0x057E) advertisers ===\n");
-    int64_t deadline = now_ms() + timeout_ms;
-    int found = 0;
-
-    while (g_running && !found) {
-        int64_t rem = deadline - now_ms();
-        if (rem <= 0) break;
-
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, (int)(rem > 500 ? 500 : rem));
-        if (pr <= 0) continue;
-
-        uint8_t buf[256];
-        int n = (int)read(fd, buf, sizeof(buf));
-        if (n < 4 || buf[0] != HCI_EVENT_PKT || buf[1] != EVT_LE_META) continue;
-
-        const uint8_t *ev = buf + 3;
-        uint8_t plen = buf[2];
-        if (plen < 3 || ev[0] != EVT_LE_ADV_REPORT) continue;
-
-        uint8_t nrep = ev[1];
-        const uint8_t *rep = ev + 2;
-        for (int ri = 0; ri < nrep && (rep - ev) < plen; ri++) {
-            uint8_t atype = rep[1];
-            if ((rep - ev) + 9 > plen) break;
-            memcpy(peer, rep+2, 6);
-            uint8_t dlen = rep[8];
-            if (dlen >= 3) {
-                /* Check for Nintendo manufacturer data (0x057E) */
-                for (int di = 0; di + 2 < dlen; ) {
-                    uint8_t el = rep[9+di], ty = rep[10+di];
-                    if (!el || di+1+el > dlen) break;
-                    if (ty == 0xFF && el >= 3) {
-                        uint16_t cid = rep[11+di] | (rep[12+di] << 8);
-                        if (cid == 0x057E) {
-                            char a[18]; ba2str((bdaddr_t*)peer, a);
-                            fprintf(stderr, "  Found: %s type=%s (Nintendo 0x057E)\n",
-                                    a, atype == 0x01 ? "random" : "public");
-                            *peer_type = atype;
-                            found = 1;
-                            goto stop_scan;
-                        }
-                    }
-                    di += 1 + el;
-                }
+/* ═══ BlueZ ownership guard ═══════════════════════════════════════════════ */
+static int check_bluez_clients(void) {
+    int count = 0;
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_type != DT_DIR) continue;
+        char path[256], buf[256];
+        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        if (fgets(buf, sizeof(buf), f)) {
+            buf[strcspn(buf, "\n")] = 0;
+            if (!strcmp(buf, "bluetoothd") || !strcmp(buf, "bluetoothctl") ||
+                !strcmp(buf, "btmgmt") || !strcmp(buf, "gatttool") ||
+                !strcmp(buf, "hcitool") || strstr(buf, "python") ||
+                strstr(buf, "bleak")) {
+                fprintf(stderr, "  CONFLICT: %s (pid=%s)\n", buf, ent->d_name);
+                count++;
             }
-            rep += 9 + dlen;
         }
+        fclose(f);
     }
-
-stop_scan:
-    hci_le_set_scan_enable(fd, 0x00, 0x00, 1000);
-done:
-    setsockopt(fd, SOL_HCI, HCI_FILTER, &of, sizeof(of));
-    close(fd);
-    return found ? 0 : -1;
+    closedir(d);
+    return count;
 }
 
-/* ── usage ──────────────────────────────────────────────────────────────── */
+static void kill_bluez_clients(void) {
+    system(
+        "killall -9 bluetoothd bluetoothctl btmgmt gatttool hcitool "
+        "2>/dev/null");
+    system("systemctl stop bluetooth 2>/dev/null");
+    usleep(500000);
+}
+
+/* ═══ usage ═══════════════════════════════════════════════════════════════ */
 static void usage(const char *p) {
     fprintf(stderr,
-        "Usage: %s [OPTIONS]\n\n"
-        "Options:\n"
-        "  --bdaddr AA:BB:CC:DD:EE:FF   Controller BDADDR\n"
-        "  --peer-addr-type public|random|auto\n"
-        "  --own-addr-type public|random\n"
-        "  --host-bdaddr auto|AA:BB:..   Host BDADDR for USB prep\n"
-        "  --auto-scan                   Scan for Switch 2 advertisers\n"
-        "  --scan-only                   Scan, print, exit\n"
-        "  --usb-init                    Run USB init sequence first\n"
-        "  --hidraw PATH                 Hidraw device (default: /dev/hidraw0)\n"
-        "  --exclusive-hci               Check no other BT clients running\n"
-        "  --kill-bluez-clients          Kill interfering BT processes\n"
-        "  --preflight                   Only check, then exit\n"
-        "  --reset-hci                   Reset hci0 (down/up) before start\n"
-        "  --verbose                     Verbose output\n"
-        "  --scan-timeout MS             Scan timeout (default 10000)\n",
-        p);
+            "Usage: %s [OPTIONS]\n\n"
+            "Options:\n"
+            "  --bdaddr AA:BB:CC:DD:EE:FF   Controller BDADDR\n"
+            "  --peer-addr-type public|random|auto\n"
+            "  --own-addr-type public|random\n"
+            "  --host-bdaddr auto|AA:BB:..   Host BDADDR for USB prep\n"
+            "  --auto-scan                   Scan for Switch 2 advertisers\n"
+            "  --scan-only                   Scan, print, exit\n"
+            "  --usb-init                    Run USB init sequence first\n"
+            "  --hidraw PATH                 Hidraw device (default: "
+            "/dev/hidraw0)\n"
+            "  --exclusive-hci               Check no other BT clients running\n"
+            "  --kill-bluez-clients          Kill interfering BT processes\n"
+            "  --preflight                   Only check, then exit\n"
+            "  --verbose                     Verbose output\n"
+            "  --scan-timeout MS             Scan timeout (default 10000)\n"
+            "\n"
+            "Architecture: HCI_CHANNEL_USER (exclusive controller access)\n"
+            "  hci0 must be DOWN. BlueZ must be stopped.\n"
+            "  No kernel interference, no MGMT contamination.\n",
+            p);
 }
 
-/* ── main ──────────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * MAIN
+ * ═══════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv) {
     const char *bdaddr_s = NULL, *hidraw = "/dev/hidraw0";
-    const char *host_spec = "auto", *peer_type_s = "public", *own_type_s = "public";
+    const char *host_spec = "auto", *peer_type_s = "public",
+               *own_type_s = "public";
     int usb_init = 0, auto_scan = 0, scan_only = 0, exclusive = 0;
-    int kill_bluez = 0, preflight = 0, reset_hci = 0, verbose = 0;
+    int kill_bluez = 0, preflight = 0, verbose = 0;
     int scan_timeout = 10000;
     uint8_t peer[6] = {0}, host_bytes[6] = {0};
     uint8_t peer_type = LE_PUBLIC_ADDRESS, own_type = LE_PUBLIC_ADDRESS;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--bdaddr") && i+1<argc) bdaddr_s = argv[++i];
-        else if (!strcmp(argv[i], "--peer-addr-type") && i+1<argc) peer_type_s = argv[++i];
-        else if (!strcmp(argv[i], "--own-addr-type") && i+1<argc) own_type_s = argv[++i];
-        else if (!strcmp(argv[i], "--host-bdaddr") && i+1<argc) host_spec = argv[++i];
-        else if (!strcmp(argv[i], "--hidraw") && i+1<argc) hidraw = argv[++i];
-        else if (!strcmp(argv[i], "--scan-timeout") && i+1<argc) scan_timeout = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--auto-scan")) auto_scan = 1;
-        else if (!strcmp(argv[i], "--scan-only")) scan_only = 1;
-        else if (!strcmp(argv[i], "--usb-init")) usb_init = 1;
-        else if (!strcmp(argv[i], "--exclusive-hci")) exclusive = 1;
-        else if (!strcmp(argv[i], "--kill-bluez-clients")) kill_bluez = 1;
-        else if (!strcmp(argv[i], "--preflight")) preflight = 1;
-        else if (!strcmp(argv[i], "--reset-hci")) reset_hci = 1;
-        else if (!strcmp(argv[i], "--verbose")) verbose = 1;
-        else { usage(argv[0]); return 2; }
+        if (!strcmp(argv[i], "--bdaddr") && i + 1 < argc)
+            bdaddr_s = argv[++i];
+        else if (!strcmp(argv[i], "--peer-addr-type") && i + 1 < argc)
+            peer_type_s = argv[++i];
+        else if (!strcmp(argv[i], "--own-addr-type") && i + 1 < argc)
+            own_type_s = argv[++i];
+        else if (!strcmp(argv[i], "--host-bdaddr") && i + 1 < argc)
+            host_spec = argv[++i];
+        else if (!strcmp(argv[i], "--hidraw") && i + 1 < argc)
+            hidraw = argv[++i];
+        else if (!strcmp(argv[i], "--scan-timeout") && i + 1 < argc)
+            scan_timeout = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--auto-scan"))
+            auto_scan = 1;
+        else if (!strcmp(argv[i], "--scan-only"))
+            scan_only = 1;
+        else if (!strcmp(argv[i], "--usb-init"))
+            usb_init = 1;
+        else if (!strcmp(argv[i], "--exclusive-hci"))
+            exclusive = 1;
+        else if (!strcmp(argv[i], "--kill-bluez-clients"))
+            kill_bluez = 1;
+        else if (!strcmp(argv[i], "--preflight"))
+            preflight = 1;
+        else if (!strcmp(argv[i], "--verbose"))
+            verbose = 1;
+        else {
+            usage(argv[0]);
+            return 2;
+        }
     }
 
     /* Resolve peer type */
-    if (!strcmp(peer_type_s, "random")) peer_type = LE_RANDOM_ADDRESS;
-    else if (!strcmp(peer_type_s, "auto")) { peer_type = LE_RANDOM_ADDRESS; auto_scan = 1; }
-
+    if (!strcmp(peer_type_s, "random"))
+        peer_type = LE_RANDOM_ADDRESS;
+    else if (!strcmp(peer_type_s, "auto")) {
+        peer_type = LE_RANDOM_ADDRESS;
+        auto_scan = 1;
+    }
     if (!strcmp(own_type_s, "random")) own_type = LE_RANDOM_ADDRESS;
 
     signal(SIGINT, on_signal);
@@ -691,39 +774,58 @@ int main(int argc, char **argv) {
     /* ── BlueZ guard ─────────────────────────────────────────────── */
     if (exclusive || kill_bluez) {
         int c = check_bluez_clients();
-        if (c > 0 && kill_bluez) { kill_bluez_clients(); c = check_bluez_clients(); }
+        if (c > 0 && kill_bluez) {
+            kill_bluez_clients();
+            c = check_bluez_clients();
+        }
         if (c > 0 && exclusive) {
-            fprintf(stderr, "ERROR: %d BT client(s) running. Use --kill-bluez-clients.\n", c);
+            fprintf(stderr,
+                    "ERROR: %d BT client(s) running. Use "
+                    "--kill-bluez-clients.\n",
+                    c);
             return 1;
         }
-        if (preflight) { fprintf(stderr, "Pre-flight OK.\n"); return 0; }
+        if (preflight) {
+            fprintf(stderr, "Pre-flight OK.\n");
+            return 0;
+        }
     }
 
-    /* ── Resolve BDDADDR ─────────────────────────────────────────── */
-    if (bdaddr_s && str2ba(bdaddr_s, (bdaddr_t*)peer) < 0) {
-        fprintf(stderr, "ERROR: invalid BDADDR: %s\n", bdaddr_s); return 2;
+    /* ── Resolve BDADDR ─────────────────────────────────────────── */
+    if (bdaddr_s && str2ba(bdaddr_s, (bdaddr_t *)peer) < 0) {
+        fprintf(stderr, "ERROR: invalid BDADDR: %s\n", bdaddr_s);
+        return 2;
     }
 
-    /* ── Host BDADDR ─────────────────────────────────────────────── */
-    int dev_id = hci_devid("hci0");
-    if (dev_id < 0) { fprintf(stderr, "ERROR: no hci0\n"); return 1; }
-
-    bdaddr_t local_ba;
-    char host_str[18] = "auto";
-    if (!strcmp(host_spec, "auto")) {
-        if (hci_devba(dev_id, &local_ba) == 0) {
-            memcpy(host_bytes, &local_ba, 6);
-            ba2str(&local_ba, host_str);
+    /* ── Resolve host BDADDR ────────────────────────────────────── */
+    {
+        uint8_t local_buf[6];
+        if (!strcmp(host_spec, "auto")) {
+            if (read_local_bdaddr(local_buf) == 0) {
+                memcpy(host_bytes, local_buf, 6);
+                fprintf(stderr,
+                        "host BDADDR (sysfs): "
+                        "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                        host_bytes[5], host_bytes[4], host_bytes[3],
+                        host_bytes[2], host_bytes[1], host_bytes[0]);
+            } else {
+                /* Fallback: known crackbery5 BDADDR */
+                uint8_t fb[6] = {0xD8, 0x3A, 0xDD, 0xE5, 0x69, 0xED};
+                memcpy(host_bytes, fb, 6);
+                fprintf(stderr, "host BDADDR (fallback): D8:3A:DD:E5:69:ED\n");
+            }
         } else {
-            perror("hci_devba"); return 1;
+            if (str2ba(host_spec, (bdaddr_t *)host_bytes) < 0) {
+                fprintf(stderr, "ERROR: invalid host BDADDR\n");
+                return 2;
+            }
+            fprintf(stderr,
+                    "host BDADDR (manual): "
+                    "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                    host_bytes[5], host_bytes[4], host_bytes[3],
+                    host_bytes[2], host_bytes[1], host_bytes[0]);
         }
-    } else {
-        if (str2ba(host_spec, (bdaddr_t*)host_bytes) < 0) {
-            fprintf(stderr, "ERROR: invalid host BDADDR\n"); return 2;
-        }
-        strncpy(host_str, host_spec, sizeof(host_str)-1);
     }
-    fprintf(stderr, "host BDADDR: %s\n", host_str);
 
     /* ── USB Init ────────────────────────────────────────────────── */
     if (usb_init) {
@@ -735,384 +837,558 @@ int main(int argc, char **argv) {
         auto_scan = 1;
     }
 
-    /* ── Auto-scan ────────────────────────────────────────────────── */
+    /* ── Auto-scan (uses libbluetooth, needs hci0 UP briefly) ────── */
     if (auto_scan && !bdaddr_s) {
-        if (scan_peer(dev_id, peer, &peer_type, scan_timeout) < 0) {
-            fprintf(stderr, "No Switch 2 controller found in scan.\n");
-            if (scan_only) return 1;
+        /* Bring hci0 UP just for scan */
+        system("hciconfig hci0 up 2>/dev/null");
+        usleep(200000);
+
+        int dev_id = hci_get_route(NULL);
+        if (dev_id < 0) dev_id = 0;
+
+        int scan_fd = hci_open_dev(dev_id);
+        if (scan_fd >= 0) {
+            /* Set filter for LE Meta events */
+            struct hci_filter of, nf;
+            socklen_t flen = sizeof(of);
+            getsockopt(scan_fd, SOL_HCI, HCI_FILTER, &of, &flen);
+            hci_filter_clear(&nf);
+            hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
+            hci_filter_set_event(EVT_LE_META, &nf);
+            setsockopt(scan_fd, SOL_HCI, HCI_FILTER, &nf, sizeof(nf));
+
+            /* Passive scan (active rejected by CYW43455) */
+            hci_le_set_scan_parameters(scan_fd, 0x00, 0x0010, 0x0010,
+                                       LE_PUBLIC_ADDRESS, 0x00, 1000);
+            hci_le_set_scan_enable(scan_fd, 0x01, 0x00, 1000);
+
+            fprintf(stderr,
+                    "=== Scanning for Nintendo (0x057E) advertisers "
+                    "===\n");
+            int64_t deadline = now_ms() + scan_timeout;
+            int found = 0;
+
+            while (g_running && !found && now_ms() < deadline) {
+                struct pollfd pfd = {.fd = scan_fd, .events = POLLIN};
+                int pr = poll(&pfd, 1, 500);
+                if (pr <= 0) continue;
+
+                uint8_t buf[256];
+                int n = (int)read(scan_fd, buf, sizeof(buf));
+                if (n < 4 || buf[0] != HCI_EVENT_PKT ||
+                    buf[1] != EVT_LE_META)
+                    continue;
+
+                const uint8_t *ev = buf + 3;
+                uint8_t plen = buf[2];
+                if (plen < 3 || ev[0] != EVT_LE_ADV_REPORT) continue;
+
+                uint8_t nrep = ev[1];
+                const uint8_t *rep = ev + 2;
+                for (int ri = 0;
+                     ri < nrep && (rep - ev) + 9 <= plen; ri++) {
+                    uint8_t atype = rep[1];
+                    memcpy(peer, rep + 2, 6);
+                    uint8_t dlen = rep[8];
+                    /* Search for Nintendo manufacturer data */
+                    for (int di = 0; di + 2 < dlen;) {
+                        uint8_t el = rep[9 + di], ty = rep[10 + di];
+                        if (!el || di + 1 + (int)el > dlen) break;
+                        if (ty == 0xFF && el >= 3) {
+                            uint16_t cid = rep[11 + di] |
+                                           (rep[12 + di] << 8);
+                            if (cid == 0x057E) {
+                                char a[18];
+                                ba2str((bdaddr_t *)peer, a);
+                                fprintf(stderr,
+                                        "  Found: %s type=%s (Nintendo "
+                                        "0x057E)\n",
+                                        a,
+                                        atype == LE_RANDOM_ADDRESS
+                                            ? "random"
+                                            : "public");
+                                peer_type = atype;
+                                found = 1;
+                                break;
+                            }
+                        }
+                        di += 1 + el;
+                    }
+                    if (found) break;
+                    rep += 9 + dlen;
+                }
+            }
+
+            hci_le_set_scan_enable(scan_fd, 0x00, 0x00, 1000);
+            setsockopt(scan_fd, SOL_HCI, HCI_FILTER, &of, sizeof(of));
+            close(scan_fd);
+
+            if (!found) {
+                fprintf(stderr,
+                        "No Switch 2 controller found in scan.\n");
+                if (scan_only) return 1;
+            }
+        } else {
+            fprintf(stderr, "WARNING: can't open hci0 for scan\n");
         }
-        char a[18]; ba2str((bdaddr_t*)peer, a);
-        fprintf(stderr, "peer: %s type=%s\n", a, peer_type == LE_RANDOM_ADDRESS ? "random" : "public");
+
+        /* Bring hci0 back DOWN for USER channel */
+        system("hciconfig hci0 down 2>/dev/null");
+        usleep(200000);
+
+        if (!peer[0] && !peer[1] && !peer[2] && !peer[3] && !peer[4] &&
+            !peer[5]) {
+            fprintf(stderr, "ERROR: no peer address found\n");
+            return 1;
+        }
+        char a[18];
+        ba2str((bdaddr_t *)peer, a);
+        fprintf(stderr,
+                "peer: %s type=%s\n", a,
+                peer_type == LE_RANDOM_ADDRESS ? "random" : "public");
         if (scan_only) return 0;
     }
 
-    /* ── HCI Reset if requested ──────────────────────────────────── */
-    if (reset_hci) {
-        system("hciconfig hci0 down 2>/dev/null");
-        usleep(500000);
-        system("hciconfig hci0 up 2>/dev/null");
-        usleep(500000);
-    }
-
-    /* ── Open sockets ─────────────────────────────────────────────── */
-    int cmd_fd = open_cmd_socket();
-    if (cmd_fd < 0) return 1;
-    int rx_fd = open_rx_socket();
-    if (rx_fd < 0) { close(cmd_fd); return 1; }
+    /* ── Open HCI_CHANNEL_USER socket ────────────────────────────── */
+    int hci_fd = open_hci_user_socket();
+    if (hci_fd < 0) return 1;
 
     /* ── HCI Init ────────────────────────────────────────────────── */
-    if (hci_init_sequence(cmd_fd) < 0) { close(cmd_fd); close(rx_fd); return 1; }
+    if (hci_init_sequence(hci_fd) < 0) {
+        close(hci_fd);
+        return 1;
+    }
 
     /* ── Session context ──────────────────────────────────────────── */
     session_t s;
     memset(&s, 0, sizeof(s));
-    s.cmd_fd = cmd_fd;
-    s.rx_fd = rx_fd;
+    s.hci_fd = hci_fd;
     s.state = STATE_DISCONNECTED;
     s.verbose = verbose;
     s.peer_addr_type = peer_type;
     s.local_addr_type = own_type;
     memcpy(s.peer_addr, peer, 6);
-    if (hci_devba(dev_id, &local_ba) == 0) memcpy(s.local_addr, &local_ba, 6);
-    memset(s.smp_tk, 0, 16);
+    memcpy(s.local_addr, host_bytes, 6);
+    memset(s.smp_tk, 0, 16); /* TK = 0 for Just Works */
 
-    fprintf(stderr, "=== sw2d_final ===\n");
-    char lstr[18], pstr[18];
-    ba2str((bdaddr_t*)s.local_addr, lstr);
-    ba2str((bdaddr_t*)peer, pstr);
-    fprintf(stderr, "local:  %s\npeer:   %s type=%s\n", lstr, pstr,
-            peer_type == LE_RANDOM_ADDRESS ? "random" : "public");
+    fprintf(stderr, "=== sw2d_final (HCI_CHANNEL_USER v3) ===\n");
+    {
+        char lstr[18], pstr[18];
+        ba2str((bdaddr_t *)s.local_addr, lstr);
+        ba2str((bdaddr_t *)peer, pstr);
+        fprintf(stderr,
+                "local:  %s\n"
+                "peer:   %s type=%s\n"
+                "socket: HCI_CHANNEL_USER (exclusive)\n",
+                lstr, pstr,
+                peer_type == LE_RANDOM_ADDRESS ? "random" : "public");
+    }
 
-    /* ── Main reconnect loop ─────────────────────────────────────── */
+    /* ═══════════════════════════════════════════════════════════════
+     * MAIN RECONNECT LOOP
+     * ═══════════════════════════════════════════════════════════════ */
     int backoff = 1;
     while (g_running) {
-        fprintf(stderr, "--- session start ---\n");
+        fprintf(stderr, "─────────────────── session start "
+                        "────────────────────\n");
         s.state = STATE_DISCONNECTED;
         s.conn_handle = 0;
         s.att_mtu = 0;
+        s.last_disconnect_reason = 0;
 
-        /* LE Create Connection */
-        if (le_create_conn(cmd_fd, s.peer_addr, s.peer_addr_type,
-                           s.local_addr_type, &s.conn_handle) < 0) goto reconnect;
-
-        if (rx_await(&s, EVT_LE_META, EVT_LE_CONN_COMPLETE, 10000) != 1 || !s.conn_handle) {
-            fprintf(stderr, "Connection failed\n");
-            goto reconnect;
+        /* ── Phase 1: LE Create Connection ────────────────────────── */
+        if (le_create_conn(&s) < 0) goto reconnect;
+        {
+            int rc = rx_await(&s, EVT_LE_META, EVT_LE_CONN_COMPLETE, NULL,
+                              NULL, 10000);
+            if (rc != 0 || !s.conn_handle) {
+                fprintf(stderr, "Connection failed (rc=%d)\n", rc);
+                goto reconnect;
+            }
         }
         s.state = STATE_CONNECTED_UNENCRYPTED;
         fprintf(stderr, "*** CONNECTED handle=0x%04x ***\n", s.conn_handle);
 
-        /* ── SMP: golden-path pairing ──────────────────────────────── */
-        /* Send pairing request as ACL on SMP_CID */
+        /* ── Phase 2: SMP Golden Path ──────────────────────────────── */
+        fprintf(stderr, "=== SMP Just Works Pairing ===\n");
+
+        /* 2a: Send Security Request first */
         {
-            uint8_t preq[] = {SMP_OP_PAIRING_REQ, 0x03, 0x00, 0x01, 0x10, 0x03, 0x03};
-            memcpy(s.smp_preq, preq, sizeof(preq));
-            if (smp_send(cmd_fd, &s, preq, sizeof(preq)) < 0) {
-                fprintf(stderr, "SMP send failed\n"); goto reconnect;
-            }
-            s.state = STATE_SMP_PAIRING_SENT;
-            fprintf(stderr, "SMP Pairing Request sent (IO=NoInputNoOutput, AuthReq=Bonding)\n");
+            uint8_t sec_req = SMP_OP_SECURITY_REQUEST;
+            uint8_t auth_req = 0x01; /* Bonding */
+            uint8_t pdu[2] = {sec_req, auth_req};
+            if (smp_send(&s, pdu, 2) < 0) goto reconnect;
+            fprintf(stderr, "  Security Request sent (Bonding)\n");
         }
 
-        /* Read SMP Pairing Response from ACL/SMP_CID */
+        /* 2b: Send Pairing Request (Golden Path) */
         {
-            int pres_len = 0;
-            uint8_t pres_buf[32];
-            int64_t smp_deadline = now_ms() + 5000;
-            while (now_ms() < smp_deadline && g_running) {
-                hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) {
-                    fprintf(stderr, "  Disconnect (0x%02x) during SMP wait\n", f.status);
-                    goto reconnect;
-                }
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == SMP_CID && f.payload_len >= 1 && f.payload[0] == SMP_OP_PAIRING_RSP) {
-                    pres_len = (int)f.payload_len;
-                    memcpy(pres_buf, f.payload, (size_t)pres_len);
-                    memcpy(s.smp_pres, f.payload, pres_len < 7 ? (size_t)pres_len : 7);
-                    break;
-                }
-            }
-            if (pres_len == 0) {
-                fprintf(stderr, "  No SMP Pairing Response — disconnect\n");
+            uint8_t preq[] = {SMP_OP_PAIRING_REQ, /* opcode */
+                              0x03,  /* IO: NoInputNoOutput */
+                              0x00,  /* OOB: not present */
+                              0x01,  /* AuthReq: Bonding (no MITM, no SC) */
+                              0x10,  /* MaxEncKeySize: 16 */
+                              0x03,  /* InitiatorKeyDist: EncKey | IdKey */
+                              0x03}; /* ResponderKeyDist: EncKey | IdKey */
+            memcpy(s.smp_preq, preq, sizeof(preq));
+            if (smp_send(&s, preq, sizeof(preq)) < 0) goto reconnect;
+            s.state = STATE_SMP_PAIRING_SENT;
+            fprintf(stderr, "  Pairing Request sent\n");
+            if (verbose) hexdump("pairing_req", preq, sizeof(preq));
+        }
+
+        /* 2c: Wait for Pairing Response on SMP_CID */
+        {
+            uint8_t buf[32];
+            uint16_t blen = sizeof(buf);
+            int rc = rx_await_acl(&s, SMP_CID, buf, &blen, 5000);
+            if (rc == -2) {
+                fprintf(stderr,
+                        "  Disconnect (0x%02x) before Pairing "
+                        "Response\n",
+                        s.last_disconnect_reason);
                 goto reconnect;
             }
-            fprintf(stderr, "  SMP Pairing Response: IO=0x%02x AuthReq=0x%02x MaxKey=%u\n",
-                    pres_buf[1], pres_buf[3], pres_buf[4]);
+            if (rc != 0 || blen < 7) {
+                fprintf(stderr,
+                        "  No SMP Pairing Response (rc=%d, len=%u)\n", rc,
+                        blen);
+                goto reconnect;
+            }
+            memcpy(s.smp_pres, buf, 7);
+            fprintf(stderr,
+                    "  Pairing Response: IO=0x%02x AuthReq=0x%02x "
+                    "MaxKey=%u\n",
+                    buf[1], buf[3], buf[4]);
+            if (buf[0] == SMP_OP_PAIRING_RSP) {
+                /* Pairing Response received — good */
+            } else if (buf[0] == SMP_OP_SECURITY_REQUEST) {
+                /* Controller echoed security request — continue */
+                fprintf(stderr, "  (Controller security request echo)\n");
+                /* Re-read for actual Pairing Response */
+                blen = sizeof(buf);
+                rc = rx_await_acl(&s, SMP_CID, buf, &blen, 5000);
+                if (rc != 0 || blen < 7 || buf[0] != SMP_OP_PAIRING_RSP) {
+                    fprintf(stderr,
+                            "  No Pairing Response after security req\n");
+                    goto reconnect;
+                }
+                memcpy(s.smp_pres, buf, 7);
+                fprintf(stderr,
+                        "  Pairing Response: IO=0x%02x AuthReq=0x%02x "
+                        "MaxKey=%u\n",
+                        buf[1], buf[3], buf[4]);
+            }
             s.state = STATE_SMP_CONFIRM_RANDOM;
         }
 
-        /* Generate confirm values using c1() */
+        /* 2d: Generate Mrand and Mconfirm via c1() */
         {
-            /* Mrand ← random 16 bytes */
-            for (int i = 0; i < 16; i++) s.smp_mrand[i] = (uint8_t)(rand() & 0xFF);
+            for (int i = 0; i < 16; i++)
+                s.smp_mrand[i] = (uint8_t)(rand() & 0xFF);
             smp_c1(s.smp_tk, s.smp_mrand, s.smp_preq, s.smp_pres,
-                   s.local_addr_type, s.local_addr,
-                   s.peer_addr_type, s.peer_addr,
-                   s.smp_mconfirm);
-            fprintf(stderr, "  Mconfirm computed\n");
+                   s.local_addr_type, s.local_addr, s.peer_addr_type,
+                   s.peer_addr, s.smp_mconfirm);
+            if (verbose)
+                hexdump("Mconfirm", s.smp_mconfirm, 16);
         }
 
-        /* Master sends Confirm */
+        /* 2e: Master sends Confirm */
         {
-            uint8_t c[17]; c[0] = SMP_OP_CONFIRM;
-            memcpy(c+1, s.smp_mconfirm, 16);
-            if (smp_send(cmd_fd, &s, c, 17) < 0) goto reconnect;
+            uint8_t c[17];
+            c[0] = SMP_OP_CONFIRM;
+            memcpy(c + 1, s.smp_mconfirm, 16);
+            if (smp_send(&s, c, 17) < 0) goto reconnect;
             fprintf(stderr, "  Confirm sent\n");
         }
 
-        /* Read Slave Confirm */
+        /* 2f: Read Slave Confirm */
         {
-            int got = 0;
-            int64_t dl = now_ms() + 5000;
-            while (now_ms() < dl && g_running) {
-                hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == SMP_CID && f.payload_len == 17 && f.payload[0] == SMP_OP_CONFIRM) {
-                    memcpy(s.smp_sconfirm, f.payload+1, 16);
-                    got = 1; break;
-                }
+            uint8_t buf[32];
+            uint16_t blen = sizeof(buf);
+            int rc = rx_await_acl(&s, SMP_CID, buf, &blen, 5000);
+            if (rc == -2)
+                goto reconnect;
+            if (rc != 0 || blen != 17 || buf[0] != SMP_OP_CONFIRM) {
+                fprintf(stderr, "  No slave confirm (rc=%d, len=%u, "
+                                "op=0x%02x)\n",
+                        rc, blen, blen > 0 ? buf[0] : 0);
+                goto reconnect;
             }
-            if (!got) { fprintf(stderr, "  No slave confirm\n"); goto reconnect; }
-            fprintf(stderr, "  Slave confirm received\n");
+            memcpy(s.smp_sconfirm, buf + 1, 16);
+            if (verbose)
+                hexdump("Sconfirm", s.smp_sconfirm, 16);
         }
 
-        /* Master sends Random */
+        /* 2g: Master sends Random */
         {
-            uint8_t r[17]; r[0] = SMP_OP_RANDOM;
-            memcpy(r+1, s.smp_mrand, 16);
-            if (smp_send(cmd_fd, &s, r, 17) < 0) goto reconnect;
+            uint8_t r[17];
+            r[0] = SMP_OP_RANDOM;
+            memcpy(r + 1, s.smp_mrand, 16);
+            if (smp_send(&s, r, 17) < 0) goto reconnect;
             fprintf(stderr, "  Random sent\n");
         }
 
-        /* Read Slave Random */
+        /* 2h: Read Slave Random */
         {
-            int got = 0;
-            int64_t dl = now_ms() + 5000;
-            while (now_ms() < dl && g_running) {
-                hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == SMP_CID && f.payload_len == 17 && f.payload[0] == SMP_OP_RANDOM) {
-                    memcpy(s.smp_srand, f.payload+1, 16);
-                    got = 1; break;
-                }
+            uint8_t buf[32];
+            uint16_t blen = sizeof(buf);
+            int rc = rx_await_acl(&s, SMP_CID, buf, &blen, 5000);
+            if (rc == -2)
+                goto reconnect;
+            if (rc != 0 || blen != 17 || buf[0] != SMP_OP_RANDOM) {
+                fprintf(stderr, "  No slave random (rc=%d, len=%u, "
+                                "op=0x%02x)\n",
+                        rc, blen, blen > 0 ? buf[0] : 0);
+                goto reconnect;
             }
-            if (!got) { fprintf(stderr, "  No slave random\n"); goto reconnect; }
-            fprintf(stderr, "  Slave random received\n");
+            memcpy(s.smp_srand, buf + 1, 16);
         }
 
-        /* Verify slave confirm */
+        /* 2i: Verify slave confirm */
         {
             uint8_t expected[16];
             smp_c1(s.smp_tk, s.smp_srand, s.smp_preq, s.smp_pres,
-                   s.peer_addr_type, s.peer_addr,
-                   s.local_addr_type, s.local_addr,
-                   expected);
+                   s.peer_addr_type, s.peer_addr, s.local_addr_type,
+                   s.local_addr, expected);
             if (memcmp(expected, s.smp_sconfirm, 16) != 0) {
                 fprintf(stderr, "  CONFIRM MISMATCH — abort\n");
+                if (verbose) {
+                    hexdump("expected", expected, 16);
+                    hexdump("received", s.smp_sconfirm, 16);
+                }
                 goto reconnect;
             }
             fprintf(stderr, "  Confirm MATCH ✓\n");
         }
 
-        /* Derive STK */
-        {
-            smp_s1(s.smp_tk, s.smp_mrand, s.smp_srand, s.smp_stk);
-            fprintf(stderr, "  STK derived\n");
-        }
+        /* 2j: Derive STK */
+        smp_s1(s.smp_tk, s.smp_mrand, s.smp_srand, s.smp_stk);
+        if (verbose) hexdump("STK", s.smp_stk, 16);
 
-        /* LE Start Encryption */
+        /* ── Phase 3: LE Start Encryption ──────────────────────────── */
         {
             uint8_t enc[28];
-            put_le16(enc+0, s.conn_handle);
-            memset(enc+2, 0, 8);  /* Random */
-            put_le16(enc+10, 0);  /* EDIV */
-            memcpy(enc+12, s.smp_stk, 16); /* LTK = STK */
-            if (raw_send_cmd(cmd_fd, OGF_LE_CTL, OCF_LE_START_ENCRYPTION, enc, sizeof(enc)) < 0)
+            put_le16(enc + 0, s.conn_handle);
+            memset(enc + 2, 0, 8);    /* Random = 0 */
+            put_le16(enc + 10, 0);    /* EDIV = 0 */
+            memcpy(enc + 12, s.smp_stk, 16); /* LTK = STK */
+            if (hci_send_cmd_(hci_fd, OGF_LE_CTL, OCF_LE_START_ENCRYPTION, enc,
+                             28) < 0)
                 goto reconnect;
             s.state = STATE_ENCRYPTION_START_SENT;
             fprintf(stderr, "  LE Start Encryption sent\n");
         }
 
-        /* Wait for Encryption Change (status 0x00) */
+        /* 3a: Handle LTK Request if kernel sends it */
+        /* 3b: Wait for Encryption Change */
         {
-            int64_t dl = now_ms() + 5000;
             int encrypted = 0;
+            int64_t dl = now_ms() + 5000;
             while (now_ms() < dl && g_running) {
                 hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
+                int rc = rx_read_frame(&s, &f, 500);
+                if (rc <= 0) continue;
+
                 if (f.pkt_type == HCI_EVENT_PKT) {
-                    if (f.evt_code == EVT_DISCONN_COMPLETE) { fprintf(stderr, "  Disconnect during enc\n"); goto reconnect; }
-                    if (f.evt_code == EVT_ENCRYPT_CHANGE && f.payload_len >= 4 &&
-                        f.payload[2] == 0x00) {
-                        encrypted = 1; break;
+                    if (f.evt_code == EVT_DISCONN_COMPLETE) {
+                        fprintf(stderr,
+                                "  Disconnect (0x%02x) during "
+                                "encryption\n",
+                                f.status);
+                        goto reconnect;
                     }
                     if (f.evt_code == EVT_ENCRYPT_CHANGE) {
-                        fprintf(stderr, "  Encryption change: status=0x%02x\n", f.payload[2]);
+                        fprintf(stderr,
+                                "  Encryption change: status=0x%02x "
+                                "handle=0x%04x\n",
+                                f.payload_len >= 3 ? f.payload[2] : 0xFF,
+                                f.handle);
+                        if (f.payload_len >= 3 && f.payload[2] == 0x00 &&
+                            f.handle == s.conn_handle) {
+                            encrypted = 1;
+                            break;
+                        }
+                    }
+                    /* Handle LTK Request */
+                    if (f.evt_code == EVT_LE_META &&
+                        f.subevent == EVT_LE_LTK_REQUEST &&
+                        f.payload_len >= 10) {
+                        uint16_t h = get_le16(f.payload + 2) & 0x0fff;
+                        fprintf(stderr,
+                                "  LTK Request handle=0x%04x — "
+                                "replying\n",
+                                h);
+                        uint8_t ltk_reply[18];
+                        put_le16(ltk_reply, h);
+                        memcpy(ltk_reply + 2, s.smp_stk, 16);
+                        hci_send_cmd_(hci_fd, OGF_LE_CTL,
+                                     OCF_LE_LTK_REQ_REPLY, ltk_reply, 18);
                     }
                 }
             }
-            if (!encrypted) { fprintf(stderr, "  Encryption failed\n"); goto reconnect; }
+            if (!encrypted) {
+                fprintf(stderr, "  Encryption failed\n");
+                goto reconnect;
+            }
             s.state = STATE_ENCRYPTED;
             fprintf(stderr, "*** ENCRYPTED ***\n");
         }
 
-        /* ── ATT/GATT after encryption ─────────────────────────────── */
+        /* ── Phase 4: ATT/GATT after encryption ────────────────────── */
         fprintf(stderr, "=== ATT/GATT ===\n");
 
-        /* ATT MTU Exchange */
+        /* 4a: ATT MTU Exchange */
         {
             uint8_t mtu[] = {ATT_OP_MTU_REQ, 0xFF, 0x00};
-            if (att_send(cmd_fd, &s, mtu, sizeof(mtu)) < 0) goto reconnect;
+            if (att_send(&s, mtu, sizeof(mtu)) < 0) goto reconnect;
             fprintf(stderr, "  ATT MTU req sent\n");
 
-            int64_t dl = now_ms() + 2000;
-            int got_mtu = 0;
-            while (now_ms() < dl && g_running) {
-                hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == ATT_CID && f.payload_len >= 3 && f.payload[0] == ATT_OP_MTU_RSP) {
-                    s.att_mtu = get_le16(f.payload+1);
-                    fprintf(stderr, "  ATT MTU: %u\n", s.att_mtu);
-                    got_mtu = 1; break;
-                }
+            uint8_t buf[32];
+            uint16_t blen = sizeof(buf);
+            int rc = rx_await_acl(&s, ATT_CID, buf, &blen, 2000);
+            if (rc == 0 && blen >= 3 && buf[0] == ATT_OP_MTU_RSP) {
+                s.att_mtu = get_le16(buf + 1);
+                fprintf(stderr, "  ATT MTU: %u\n", s.att_mtu);
+            } else {
+                s.att_mtu = 23; /* default */
+                fprintf(stderr, "  ATT MTU: default %u\n", s.att_mtu);
             }
-            if (!got_mtu) s.att_mtu = 23; /* default */
             s.state = STATE_ATT_READY;
         }
 
-        /* GATT: discover primary services */
+        /* 4b: GATT discover primary services */
         uint16_t svc_start = 0, svc_end = 0;
         {
-            uint8_t req[] = {ATT_OP_READ_BY_GROUP_REQ, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28};
-            if (att_send(cmd_fd, &s, req, sizeof(req)) < 0) goto reconnect;
+            uint8_t req[] = {ATT_OP_READ_BY_GROUP_REQ, 0x01, 0x00, 0xFF,
+                             0xFF, 0x00, 0x28};
+            if (att_send(&s, req, sizeof(req)) < 0) goto reconnect;
 
-            int64_t dl = now_ms() + 3000;
-            while (now_ms() < dl && g_running) {
-                hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == ATT_CID) {
-                    if (f.payload_len >= 3 && f.payload[0] == ATT_OP_READ_BY_GROUP_RSP) {
-                        int elen = f.payload[1];
-                        if (elen >= 6 && !svc_start) {
-                            svc_start = get_le16(f.payload+2);
-                            svc_end   = get_le16(f.payload+4);
-                            fprintf(stderr, "  Service: 0x%04x-0x%04x\n", svc_start, svc_end);
-                        }
-                        break;
-                    }
-                    if (f.payload_len >= 1 && f.payload[0] == ATT_OP_ERROR_RSP) {
-                        fprintf(stderr, "  GATT error on service discovery\n"); break;
-                    }
-                }
-            }
-            if (!svc_start) {
+            uint8_t buf[64];
+            uint16_t blen = sizeof(buf);
+            int rc = rx_await_acl(&s, ATT_CID, buf, &blen, 3000);
+            if (rc == 0 && blen >= 6 &&
+                buf[0] == ATT_OP_READ_BY_GROUP_RSP) {
+                svc_start = get_le16(buf + 2);
+                svc_end = get_le16(buf + 4);
+                fprintf(stderr, "  Service: 0x%04x-0x%04x\n", svc_start,
+                        svc_end);
+            } else {
                 /* Fallback: use full range */
-                svc_start = 0x0001; svc_end = 0xFFFF;
-                fprintf(stderr, "  Using full range for char discovery\n");
+                svc_start = 0x0001;
+                svc_end = 0xFFFF;
+                fprintf(stderr,
+                        "  Using full range for char discovery\n");
             }
-            s.svc_start = svc_start; s.svc_end = svc_end;
+            s.svc_start = svc_start;
+            s.svc_end = svc_end;
         }
 
-        /* GATT: discover characteristics */
+        /* 4c: GATT discover characteristics */
         {
-            uint8_t req[] = {ATT_OP_READ_BY_TYPE_REQ,
-                             (uint8_t)(svc_start & 0xFF), (uint8_t)(svc_start >> 8),
-                             (uint8_t)(svc_end & 0xFF), (uint8_t)(svc_end >> 8),
-                             0x03, 0x28}; /* UUID for characteristic */
-            if (att_send(cmd_fd, &s, req, sizeof(req)) < 0) goto reconnect;
+            uint8_t req[] = {
+                ATT_OP_READ_BY_TYPE_REQ,
+                (uint8_t)(svc_start & 0xFF),
+                (uint8_t)(svc_start >> 8),
+                (uint8_t)(svc_end & 0xFF),
+                (uint8_t)(svc_end >> 8),
+                0x03,
+                0x28}; /* UUID for characteristic */
+            if (att_send(&s, req, sizeof(req)) < 0) goto reconnect;
 
             int64_t dl = now_ms() + 3000;
             while (now_ms() < dl && g_running) {
-                hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == ATT_CID && f.payload_len >= 1) {
-                    if (f.payload[0] == ATT_OP_READ_BY_TYPE_RSP) {
-                        int elen = f.payload[1];
-                        if (elen >= 7) {
-                            uint16_t val_handle = get_le16(f.payload+5);
-                            uint8_t  props      = f.payload[4];
-                            fprintf(stderr, "  Char: props=0x%02x value=0x%04x\n", props, val_handle);
-                            if (props & 0x10) { /* notify */
-                                s.report_handle = val_handle;
-                                s.report_cccd   = val_handle + 1;
-                                fprintf(stderr, "    -> INPUT (notify) handle=0x%04x cccd=0x%04x\n",
-                                        s.report_handle, s.report_cccd);
-                            }
-                        }
+                uint8_t buf[64];
+                uint16_t blen = sizeof(buf);
+                int rc = rx_await_acl(&s, ATT_CID, buf, &blen,
+                                      (int)(dl - now_ms()));
+                if (rc == -2) goto reconnect;
+                if (rc != 0) continue;
+
+                if (buf[0] == ATT_OP_READ_BY_TYPE_RSP && blen >= 7) {
+                    uint8_t props = buf[4];
+                    uint16_t val_handle = get_le16(buf + 5);
+                    fprintf(stderr,
+                            "  Char: props=0x%02x value=0x%04x\n", props,
+                            val_handle);
+                    if (props & 0x10) { /* notify */
+                        s.report_handle = val_handle;
+                        s.report_cccd = val_handle + 1;
+                        fprintf(stderr,
+                                "    -> INPUT (notify) "
+                                "handle=0x%04x "
+                                "cccd=0x%04x\n",
+                                s.report_handle, s.report_cccd);
                     }
-                    if (f.payload[0] == ATT_OP_ERROR_RSP) break;
                 }
+                if (buf[0] == ATT_OP_ERROR_RSP) break;
             }
             if (!s.report_handle) {
-                fprintf(stderr, "  WARNING: no notify characteristic found\n");
-                s.report_handle = 0x000E; s.report_cccd = 0x000F;
+                fprintf(stderr,
+                        "  WARNING: no notify characteristic found\n");
+                s.report_handle = 0x000E;
+                s.report_cccd = 0x000F;
             }
             s.state = STATE_GATT_READY;
         }
 
-        /* Enable notifications (CCCD write) */
+        /* 4d: Enable notifications (CCCD write 0x0001) */
         {
-            uint8_t req[] = {ATT_OP_WRITE_REQ,
-                             (uint8_t)(s.report_cccd & 0xFF), (uint8_t)(s.report_cccd >> 8),
-                             0x01, 0x00}; /* enable notification */
-            if (att_send(cmd_fd, &s, req, sizeof(req)) < 0) goto reconnect;
+            uint8_t req[] = {
+                ATT_OP_WRITE_REQ, (uint8_t)(s.report_cccd & 0xFF),
+                (uint8_t)(s.report_cccd >> 8), 0x01, 0x00};
+            if (att_send(&s, req, sizeof(req)) < 0) goto reconnect;
 
-            int64_t dl = now_ms() + 2000;
-            while (now_ms() < dl && g_running) {
-                hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 500);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) goto reconnect;
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == ATT_CID && f.payload_len >= 1 && f.payload[0] == ATT_OP_WRITE_RSP) {
-                    fprintf(stderr, "  CCCD write OK — notifications enabled\n");
-                    break;
-                }
+            uint8_t buf[16];
+            uint16_t blen = sizeof(buf);
+            int rc = rx_await_acl(&s, ATT_CID, buf, &blen, 2000);
+            if (rc == 0 && blen >= 1 && buf[0] == ATT_OP_WRITE_RSP) {
+                fprintf(stderr,
+                        "  CCCD write OK — notifications enabled\n");
+            } else {
+                fprintf(stderr,
+                        "  CCCD write: no explicit response (rc=%d), "
+                        "assuming enabled\n",
+                        rc);
             }
             s.state = STATE_NOTIFICATIONS_ENABLED;
         }
 
-        /* ── Input Report Loop ───────────────────────────────────────── */
+        /* ── Phase 5: Input Report Loop ─────────────────────────────── */
         fprintf(stderr, "=== Receiving input reports ===\n");
         {
             int count = 0;
             while (g_running && s.state == STATE_NOTIFICATIONS_ENABLED) {
                 hci_frame_t f;
-                int n = rx_read_frame(&s, &f, 1000);
-                if (n <= 0) continue;
-                if (f.pkt_type == HCI_EVENT_PKT && f.evt_code == EVT_DISCONN_COMPLETE) {
-                    fprintf(stderr, "  Disconnected (%d reports)\n", count);
+                int rc = rx_read_frame(&s, &f, 1000);
+                if (rc <= 0) continue;
+
+                if (f.pkt_type == HCI_EVENT_PKT &&
+                    f.evt_code == EVT_DISCONN_COMPLETE) {
+                    fprintf(stderr,
+                            "  Disconnected (%d reports, "
+                            "reason=0x%02x)\n",
+                            count, f.status);
+                    s.last_disconnect_reason = f.status;
                     break;
                 }
-                if (f.pkt_type == HCI_ACLDATA_PKT && f.handle == s.conn_handle &&
-                    f.cid == ATT_CID && f.payload_len >= 3 && f.payload[0] == ATT_OP_HANDLE_NOTIFY) {
-                    uint16_t vh = get_le16(f.payload+1);
+                if (f.pkt_type == HCI_ACLDATA_PKT &&
+                    f.handle == s.conn_handle && f.cid == ATT_CID &&
+                    f.payload_len >= 3 &&
+                    f.payload[0] == ATT_OP_HANDLE_NOTIFY) {
+                    uint16_t vh = get_le16(f.payload + 1);
                     uint16_t vl = f.payload_len - 3;
                     const uint8_t *vd = f.payload + 3;
-                    if (vh == s.report_handle && vl >= 1 && vd[0] == 0x09) {
+                    if (vh == s.report_handle && vl >= 1 &&
+                        vd[0] == 0x09) {
                         count++;
-                        fprintf(stderr, "REPORT #%d (%d bytes): ", count, vl);
-                        for (int i = 0; i < vl && i < 16; i++) fprintf(stderr, "%02x ", vd[i]);
-                        fprintf(stderr, "\n");
+                        if (count <= 10 || count % 50 == 0) {
+                            fprintf(stderr,
+                                    "REPORT #%d (%d bytes): ", count, vl);
+                            for (int i = 0; i < vl && i < 16; i++)
+                                fprintf(stderr, "%02x ", vd[i]);
+                            fprintf(stderr, "\n");
+                        }
                     }
                 }
             }
@@ -1125,8 +1401,7 @@ int main(int argc, char **argv) {
         if (backoff < 16) backoff *= 2;
     }
 
-    close(cmd_fd);
-    close(rx_fd);
+    close(hci_fd);
     fprintf(stderr, "sw2d_final: stopped\n");
     return 0;
 }
