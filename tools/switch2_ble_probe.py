@@ -460,7 +460,11 @@ class ProbeSession:
 
     async def _disconnect_client(self) -> None:
         """Disconnect and clear current client if present."""
-        await self._disconnect_client()
+        if self.client and self.client.is_connected:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
         self.client = None
 
     # ── Service Discovery ────────────────────────────────────
@@ -573,23 +577,28 @@ class ProbeSession:
             return False
 
         commands = list(PROCON2_INIT_COMMANDS)
+        # 200ms barrier between feat-select init and LED/Sound (joycon2cpp-proven gap)
+        has_output = (not self.args.no_led) or (not self.args.no_sound)
+        if has_output:
+            commands.append(("--- 200ms barrier ---", None, 0.2))
         if not self.args.no_led:
             commands.append(("Set LED 1", PROCON2_LED_COMMAND, 0.05))
         if not self.args.no_sound:
             commands.append(("Emit sound", PROCON2_SOUND_COMMAND, 0.05))
 
         for label, payload, delay_s in commands:
-            self._log(f"  -> {label}: {hexdump(payload)}")
-            try:
-                await self.client.write_gatt_char(
-                    COMMAND_WRITE_UUID,
-                    payload,
-                    response=False,
-                )
-            except Exception as e:
-                self._log(f"  <- {label}: FAILED: {e}", level="error")
-                return False
-            self._log(f"  <- {label}: write OK (without response)")
+            self._log(f"  -> {label}: {hexdump(payload) if payload else '(barrier only)'}")
+            if payload:  # barrier entries have no payload
+                try:
+                    await self.client.write_gatt_char(
+                        COMMAND_WRITE_UUID,
+                        payload,
+                        response=False,
+                    )
+                except Exception as e:
+                    self._log(f"  <- {label}: FAILED: {e}", level="error")
+                    return False
+                self._log(f"  <- {label}: write OK (without response)")
             if delay_s:
                 await asyncio.sleep(delay_s)
 
