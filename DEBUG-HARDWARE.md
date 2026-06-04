@@ -50,6 +50,9 @@ advertising window. Press the controller's sync button, then run:
 sudo ./sw2d_final --scan-only --auto-scan --peer-addr-type auto --scan-timeout 15000 --verbose
 ```
 
+This scan uses the same `HCI_CHANNEL_USER` socket as the later connection, so it
+does not briefly hand the adapter back to BlueZ/libbluetooth.
+
 Expected result:
 
 - `ADV: ... type=random|public` lines while scanning

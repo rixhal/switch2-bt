@@ -1,22 +1,19 @@
-/* test_adv_parse.c - Test scan_for_peer parser with synthetic LE Advertising Report bytes */
+/* test_adv_parse.c - Test Switch 2 Pro LE Advertising Report parsing */
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
+#include <string.h>
 #include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
-#include <bluetooth/hci_lib.h>
 
-/*
- * This test constructs a synthetic LE Advertising Report event
- * and verifies the parsing logic that scan_for_peer() uses.
- */
-
-#define HCI_EVENT_PKT    0x04
-#define EVT_LE_META      0x3e
+#define HCI_EVENT_PKT             0x04
+#define EVT_LE_META               0x3e
 #define EVT_LE_ADVERTISING_REPORT 0x02
 
 static int failures = 0;
+
+static uint16_t get_le16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
 
 static void check(const char *name, int condition)
 {
@@ -28,135 +25,108 @@ static void check(const char *name, int condition)
     }
 }
 
-/*
- * Build a synthetic HCI LE Advertising Report event:
- *   buf[0] = HCI_EVENT_PKT
- *   buf[1] = EVT_LE_META
- *   buf[2] = param_len
- *   buf[3] = EVT_LE_ADVERTISING_REPORT (subevent)
- *   buf[4] = num_reports
- *   buf[5+] = report(s)
- *
- * Report format (per BT spec):
- *   [0]   = event_type
- *   [1]   = address_type
- *   [2-7] = BDADDR (6 bytes)
- *   [8]   = data_length
- *   [9+]  = data
- */
-int main(void)
+static int adv_data_has_switch2_pro(const uint8_t *data, uint8_t dlen)
 {
-    uint8_t buf[64];
-    
-    /* Synthetic report: random address DE:AD:BE:EF:CA:FE, type=0x03 (connectable undirected)
-       addr_type=0x01 (random), with some advertising data */
-    memset(buf, 0, sizeof(buf));
-    buf[0] = HCI_EVENT_PKT;            /* pkt_type */
-    buf[1] = EVT_LE_META;              /* event */
-    /* param_len will go at buf[2] */
-    
-    uint8_t *ev = buf + 3;
-    ev[0] = EVT_LE_ADVERTISING_REPORT; /* subevent */
-    ev[1] = 1;                         /* num_reports */
-    
-    uint8_t *rep = ev + 2;
-    rep[0] = 0x03;                     /* event_type: ADV_IND (connectable undirected) */
-    rep[1] = 0x01;                     /* address_type: random */
-    rep[2] = 0xDE; rep[3] = 0xAD; rep[4] = 0xBE; /* BDADDR */
-    rep[5] = 0xEF; rep[6] = 0xCA; rep[7] = 0xFE;
-    rep[8] = 5;                        /* data_length */
-    /* Advertising data: flags + partial name */
-    rep[9]  = 0x02;                    /* len=2 */
-    rep[10] = 0x01;                    /* type=flags */
-    rep[11] = 0x06;                    /* LE General Discoverable + BR/EDR Not Supported */
-    rep[12] = 0x04;                    /* len=4 */
-    rep[13] = 0x08;                    /* type=shortened local name */
-    rep[14] = 'S';                     /* "SW2 " */
-    rep[15] = 'W';
-    rep[16] = '2';
-
-    uint8_t param_len = (uint8_t)(2 + 9 + 7); /* subevent(1) + num(1) + report(9+7) */
-    buf[2] = param_len;
-
-    /* Now simulate the parsing logic from scan_for_peer() */
-    int found = 0;
-    uint8_t found_type = 0;
-    char found_addr[18] = {0};
-
-    int plen = param_len;
-    uint8_t sub = ev[0];
-    check("subevent", sub == EVT_LE_ADVERTISING_REPORT);
-
-    uint8_t num_reports = ev[1];
-    check("num_reports", num_reports == 1);
-
-    for (int r = 0; r < num_reports && (rep - ev) < plen; r++) {
-        uint8_t addr_type = rep[1];
-
-        bdaddr_t rba;
-        memcpy(&rba, rep + 2, 6);
-        char rba_str[18];
-        ba2str(&rba, rba_str);
-
-        uint8_t data_len = rep[8];
-
-        fprintf(stderr, "  adv: %s type=%u data_len=%u\n", rba_str, addr_type, data_len);
-
-        if (!found) {
-            found_type = addr_type;
-            snprintf(found_addr, sizeof(found_addr), "%s", rba_str);
-            found = 1;
+    for (int di = 0; di + 2 < dlen;) {
+        uint8_t el = data[di];
+        uint8_t ty = data[di + 1];
+        if (!el || di + 1 + (int)el > dlen) break;
+        if (ty == 0xff && el >= 7) {
+            uint16_t cid = get_le16(data + di + 2);
+            uint16_t vid = get_le16(data + di + 4);
+            uint16_t pid = get_le16(data + di + 6);
+            if (cid == 0x0553 && vid == 0x057e && pid == 0x2069)
+                return 1;
+            if (cid == 0x0553 && el >= 10) {
+                vid = get_le16(data + di + 7);
+                pid = get_le16(data + di + 9);
+                if (vid == 0x057e && pid == 0x2069)
+                    return 1;
+            }
         }
-
-        rep += 9 + data_len;
+        di += 1 + el;
     }
+    return 0;
+}
 
-    check("found", found == 1);
-    check("addr_type_random", found_type == 0x01);
-    check("addr_value", strcmp(found_addr, "FE:CA:EF:BE:AD:DE") == 0);
+static int parse_one_report(const uint8_t *ev, uint8_t plen,
+                            uint8_t out_addr[6], uint8_t *out_type)
+{
+    if (plen < 3 || ev[0] != EVT_LE_ADVERTISING_REPORT) return 0;
 
-    /* Test with a second synthetic report for a public address */
-    memset(buf, 0, sizeof(buf));
+    uint8_t nrep = ev[1];
+    size_t off = 2;
+    for (int ri = 0; ri < nrep && off + 10 <= plen; ri++) {
+        const uint8_t *rep = ev + off;
+        uint8_t dlen = rep[8];
+        if (off + 10 + dlen > plen) break;
+
+        if (adv_data_has_switch2_pro(rep + 9, dlen)) {
+            *out_type = rep[1];
+            memcpy(out_addr, rep + 2, 6);
+            return 1;
+        }
+        off += 10 + dlen;
+    }
+    return 0;
+}
+
+static void build_report(uint8_t *buf, uint8_t addr_type,
+                         const uint8_t addr[6],
+                         const uint8_t *adv, uint8_t adv_len)
+{
+    memset(buf, 0, 128);
     buf[0] = HCI_EVENT_PKT;
     buf[1] = EVT_LE_META;
 
-    ev = buf + 3;
+    uint8_t *ev = buf + 3;
     ev[0] = EVT_LE_ADVERTISING_REPORT;
     ev[1] = 1;
 
-    rep = ev + 2;
-    rep[0] = 0x04;
-    rep[1] = 0x00;
-    rep[2] = 0x11; rep[3] = 0x22; rep[4] = 0x33;
-    rep[5] = 0x44; rep[6] = 0x55; rep[7] = 0x66;
-    rep[8] = 3;
-    rep[9] = 0x02; rep[10] = 0x0a; rep[11] = 0xff;
+    uint8_t *rep = ev + 2;
+    rep[0] = 0x00;       /* ADV_IND */
+    rep[1] = addr_type;
+    memcpy(rep + 2, addr, 6);
+    rep[8] = adv_len;
+    memcpy(rep + 9, adv, adv_len);
+    rep[9 + adv_len] = 0xc3; /* RSSI = -61 */
 
-    buf[2] = (uint8_t)(2 + 9 + 3);
+    buf[2] = (uint8_t)(2 + 10 + adv_len);
+}
 
-    found = 0;
-    sub = ev[0];
-    num_reports = ev[1];
-    plen = buf[2];
+int main(void)
+{
+    uint8_t buf[128], found[6], found_type = 0;
+    char addr_txt[18];
 
-    for (int r = 0; r < num_reports && (rep - ev) < plen; r++) {
-        uint8_t addr_type = rep[1];
-        bdaddr_t rba;
-        memcpy(&rba, rep + 2, 6);
-        char rba_str[18];
-        ba2str(&rba, rba_str);
+    const uint8_t addr[6] = {0x76, 0xc6, 0x3b, 0xbf, 0xef, 0xe0};
+    const uint8_t phase_a_mfg[] = {
+        0x01, 0x00, 0x03, 0x7e, 0x05, 0x69, 0x20, 0x00,
+        0x01, 0x00, 0x31, 0xf8, 0x94, 0x55, 0xe2, 0x98,
+        0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    uint8_t adv[40];
+    adv[0] = 0x02; adv[1] = 0x01; adv[2] = 0x06;
+    adv[3] = (uint8_t)(sizeof(phase_a_mfg) + 3);
+    adv[4] = 0xff;
+    adv[5] = 0x53; adv[6] = 0x05;
+    memcpy(adv + 7, phase_a_mfg, sizeof(phase_a_mfg));
 
-        if (!found) {
-            found_type = addr_type;
-            snprintf(found_addr, sizeof(found_addr), "%s", rba_str);
-            found = 1;
-        }
+    check("switch2 payload match",
+          adv_data_has_switch2_pro(adv, (uint8_t)(7 + sizeof(phase_a_mfg))) == 1);
 
-        rep += 9 + rep[8];
-    }
+    build_report(buf, 0x01, addr, adv, (uint8_t)(7 + sizeof(phase_a_mfg)));
+    check("parse switch2 report",
+          parse_one_report(buf + 3, buf[2], found, &found_type) == 1);
+    ba2str((bdaddr_t *)found, addr_txt);
+    check("addr type random", found_type == 0x01);
+    check("addr value", strcmp(addr_txt, "E0:EF:BF:3B:C6:76") == 0);
 
-    check("public_addr_type", found_type == 0x00);
-    check("public_addr_value", strcmp(found_addr, "66:55:44:33:22:11") == 0);
+    /* Same Nintendo manufacturer and VID, wrong PID must not match. */
+    adv[12] = 0x66;
+    adv[13] = 0x20;
+    check("wrong pid rejected",
+          adv_data_has_switch2_pro(adv, (uint8_t)(7 + sizeof(phase_a_mfg))) == 0);
 
     if (failures) {
         fprintf(stderr, "\n%d tests FAILED\n", failures);

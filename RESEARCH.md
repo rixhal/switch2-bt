@@ -176,17 +176,36 @@ Offset  Size  Field
   LE_CONN_COMPLETE st=0xff handle=0x007f
   raw: 01 ff 7f 00 00 db 34 b6 d7 82 de 1b 43 f4 01 00 00 00 00
   ```
-- Event peer was `DE:82:D7:B6:34:DB`, not the requested
-  `E0:EF:BF:3B:C6:76`
-- `E0:...` has top bits `11`, so it looks like a static random address; using
-  `peer-addr-type public` is suspicious unless btmon proves otherwise
+- Earlier notes decoded the event peer one byte off. Per HCI LE Connection
+  Complete offsets, byte 5 is `Peer_Address_Type`; the peer address starts at
+  byte 6. The event peer from this failed event is `1B:DE:82:D7:B6:34`, and
+  `Peer_Address_Type=0xdb` is invalid. Because `status != 0`, the peer fields
+  should be treated as diagnostic only, not as a trustworthy remote identity.
+- `E0:...` has top bits `11`, so it looks like a static random address; the
+  address type from the advertising report must be used for LE Create
+  Connection.
 - Current hypothesis: stale rotated BDADDR, wrong peer address type, or expired
   advertising window
-- Debug rule for next hardware run: press sync, run `--scan-only --auto-scan
-  --peer-addr-type auto`, copy the current address and type, then connect with
-  exactly those values
+- Debug rule for next hardware run: use `--auto-scan --peer-addr-type auto` so
+  scan and connect use the same HCI_CHANNEL_USER socket and the current
+  advertising address/type.
 - Code now logs the peer address and peer type from `LE Connection Complete` and
   warns when the event peer differs from the requested peer
+
+### Phase 13: Debug Surface Reduction (2026-06-04)
+
+- Weakness found: `sw2d_final.c` briefly used libbluetooth/BlueZ RAW scanning
+  before switching back to HCI_CHANNEL_USER for connection. On CYW43455 this can
+  leave controller state behind and undermines the BlueZ-bypass architecture.
+- Fix: auto-scan now sends LE Set Scan Parameters/Enable over the same
+  HCI_CHANNEL_USER socket used for LE Create Connection.
+- Weakness found: synthetic advertising tests did not cover the real Switch 2
+  Pro manufacturer payload.
+- Fix: `test_adv_parse` now checks the Phase A payload (`0x0553`, `0x057E`,
+  `0x2069`) and rejects other Nintendo PIDs.
+- Remaining open question: after a clean raw-HCI connection, determine whether
+  reports require Bluetooth SMP, vendor-specific GATT pairing (`0x15` sequence),
+  or both in a specific order.
 
 ### External References
 

@@ -52,8 +52,12 @@ typedef hci_user_frame_t hci_frame_t;
 /* OGF/OCF not in transport header */
 #define OCF_LE_CONN_UPDATE        0x0013
 #define OCF_LE_LTK_REQ_NEG_REPLY  0x001b
+#ifndef OCF_LE_SET_SCAN_PARAMS
 #define OCF_LE_SET_SCAN_PARAMS    0x000b
+#endif
+#ifndef OCF_LE_SET_SCAN_ENABLE
 #define OCF_LE_SET_SCAN_ENABLE    0x000c
+#endif
 
 /* L2CAP CIDs */
 #define ATT_CID             0x0004
@@ -179,6 +183,130 @@ static int read_local_bdaddr(uint8_t out[6]) {
         return 0;
     }
     return -1;
+}
+
+static int adv_data_has_switch2_pro(const uint8_t *data, uint8_t dlen,
+                                    uint16_t *out_cid,
+                                    uint16_t *out_vid,
+                                    uint16_t *out_pid) {
+    for (int di = 0; di + 2 < dlen;) {
+        uint8_t el = data[di];
+        uint8_t ty = data[di + 1];
+        if (!el || di + 1 + (int)el > dlen) break;
+
+        if (ty == 0xFF && el >= 7) {
+            const uint8_t *m = data + di + 2;
+            uint16_t cid = get_le16(m + 0);
+            uint16_t vid = el >= 7 ? get_le16(m + 2) : 0;
+            uint16_t pid = el >= 7 ? get_le16(m + 4) : 0;
+            if (cid == 0x0553 && vid == 0x057E && pid == 0x2069) {
+                if (out_cid) *out_cid = cid;
+                if (out_vid) *out_vid = vid;
+                if (out_pid) *out_pid = pid;
+                return 1;
+            }
+
+            /* Phase A captures show Switch 2 data as:
+             * company 0x0553, then 01 00 03, then VID/PID. */
+            if (cid == 0x0553 && el >= 10) {
+                vid = get_le16(m + 5);
+                pid = get_le16(m + 7);
+            }
+            if (cid == 0x0553 && vid == 0x057E && pid == 0x2069) {
+                if (out_cid) *out_cid = cid;
+                if (out_vid) *out_vid = vid;
+                if (out_pid) *out_pid = pid;
+                return 1;
+            }
+        }
+        di += 1 + el;
+    }
+    return 0;
+}
+
+static int scan_for_peer_user(int hci_fd, uint8_t peer[6],
+                              uint8_t *peer_type, uint8_t own_type,
+                              int timeout_ms, int verbose) {
+    uint8_t params[7];
+    put_le16(params + 0, 0x0010);  /* scan interval (10ms) */
+    put_le16(params + 2, 0x0010);  /* scan window (10ms) */
+    params[4] = 0x00;              /* passive scan */
+    params[5] = own_type;
+    params[6] = 0x00;              /* accept all advertising packets */
+
+    fprintf(stderr, "=== Scanning for Switch 2 Pro advertisers (USER) ===\n");
+    if (hci_user_send_cmd(hci_fd, OGF_LE_CTL, OCF_LE_SET_SCAN_PARAMS,
+                          params, sizeof(params)) < 0)
+        return -1;
+
+    uint8_t enable[] = {0x01, 0x00}; /* enable, no duplicate filtering */
+    if (hci_user_send_cmd(hci_fd, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
+                          enable, sizeof(enable)) < 0)
+        return -1;
+
+    int found = 0;
+    int64_t deadline = now_ms() + timeout_ms;
+    while (g_running && !found && now_ms() < deadline) {
+        int64_t rem = deadline - now_ms();
+        hci_frame_t f;
+        int rc = hci_user_read_frame(hci_fd, &f,
+                                     (int)(rem > 500 ? 500 : rem));
+        if (rc <= 0) continue;
+        if (f.pkt_type != HCI_EVENT_PKT ||
+            f.evt_code != EVT_LE_META ||
+            f.subevent != EVT_LE_ADV_REPORT ||
+            f.payload_len < 3)
+            continue;
+
+        uint16_t plen = f.payload_len;
+        if (f.raw_len >= 3 && plen > f.raw_len - 3)
+            plen = (uint16_t)(f.raw_len - 3);
+
+        uint8_t nrep = f.payload[1];
+        size_t off = 2;
+        for (int ri = 0; ri < nrep && off + 10 <= plen; ri++) {
+            const uint8_t *rep = f.payload + off;
+            uint8_t atype = rep[1];
+            uint8_t dlen = rep[8];
+            if (off + 10 + dlen > plen) break;
+
+            const uint8_t *adv = rep + 9;
+            int8_t rssi = (int8_t)rep[9 + dlen];
+            uint16_t cid = 0, vid = 0, pid = 0;
+
+            if (verbose) {
+                char a[18];
+                ba2str((const bdaddr_t *)(rep + 2), a);
+                fprintf(stderr, "  ADV: %s type=%s dlen=%u rssi=%d\n",
+                        a, addr_type_name(atype), dlen, rssi);
+                hexdump("adv_data", adv, dlen);
+            }
+
+            if (adv_data_has_switch2_pro(adv, dlen, &cid, &vid, &pid)) {
+                char a[18];
+                memcpy(peer, rep + 2, 6);
+                *peer_type = atype;
+                ba2str((const bdaddr_t *)peer, a);
+                fprintf(stderr, "  Found: %s type=%s "
+                                "(Nintendo cid=0x%04x vid=0x%04x pid=0x%04x)\n",
+                        a, addr_type_name(atype), cid, vid, pid);
+                found = 1;
+                break;
+            }
+
+            off += 10 + dlen;
+        }
+    }
+
+    uint8_t disable[] = {0x00, 0x00};
+    hci_user_send_cmd(hci_fd, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
+                      disable, sizeof(disable));
+
+    if (!found) {
+        fprintf(stderr, "No Switch 2 Pro controller found in scan.\n");
+        return -1;
+    }
+    return 0;
 }
 
 /* ═══ LE Create Connection (wrapper over transport) ═════════════════════ */
@@ -734,108 +862,6 @@ int main(int argc, char **argv) {
         auto_scan = 1;
     }
 
-    /* ── Auto-scan (libbluetooth, needs hci0 UP briefly) ─────────── */
-    if (auto_scan && !bdaddr_s) {
-        system("hciconfig hci0 up 2>/dev/null");
-        usleep(200000);
-
-        int dev_id = hci_get_route(NULL);
-        if (dev_id < 0) dev_id = 0;
-
-        int scan_fd = hci_open_dev(dev_id);
-        if (scan_fd >= 0) {
-            struct hci_filter of, nf;
-            socklen_t flen = sizeof(of);
-            getsockopt(scan_fd, SOL_HCI, HCI_FILTER, &of, &flen);
-            hci_filter_clear(&nf);
-            hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
-            hci_filter_set_event(EVT_LE_META, &nf);
-            setsockopt(scan_fd, SOL_HCI, HCI_FILTER, &nf, sizeof(nf));
-
-            /* Passive scan (CYW43455 rejects active) */
-            hci_le_set_scan_parameters(scan_fd, 0x00, 0x0010, 0x0010,
-                                       LE_PUBLIC_ADDRESS, 0x00, 1000);
-            hci_le_set_scan_enable(scan_fd, 0x01, 0x00, 1000);
-
-            fprintf(stderr, "=== Scanning for Nintendo advertisers ===\n");
-            int64_t deadline = now_ms() + scan_timeout;
-            int found = 0;
-
-            while (g_running && !found && now_ms() < deadline) {
-                struct pollfd pfd = {.fd = scan_fd, .events = POLLIN};
-                if (poll(&pfd, 1, 500) <= 0) continue;
-
-                uint8_t buf[256];
-                int n = (int)read(scan_fd, buf, sizeof(buf));
-                if (n < 4 || buf[0] != HCI_EVENT_PKT || buf[1] != EVT_LE_META)
-                    continue;
-
-                const uint8_t *ev = buf + 3;
-                uint8_t plen = buf[2];
-                if (plen < 3 || ev[0] != EVT_LE_ADV_REPORT) continue;
-
-                uint8_t nrep = ev[1];
-                size_t off = 2;
-                for (int ri = 0; ri < nrep && off + 10 <= plen; ri++) {
-                    const uint8_t *rep = ev + off;
-                    uint8_t atype = rep[1];
-                    memcpy(peer, rep + 2, 6);
-                    uint8_t dlen = rep[8];
-                    if (off + 10 + dlen > plen) break;
-                    int8_t rssi = (int8_t)rep[9 + dlen];
-                    if (verbose) {
-                        char a[18];
-                        ba2str((bdaddr_t *)peer, a);
-                        fprintf(stderr, "  ADV: %s type=%s dlen=%u rssi=%d\n",
-                                a, addr_type_name(atype), dlen, rssi);
-                        hexdump("adv_data", rep + 9, dlen);
-                    }
-                    for (int di = 0; di + 2 < dlen;) {
-                        uint8_t el = rep[9 + di], ty = rep[10 + di];
-                        if (!el || di + 1 + (int)el > dlen) break;
-                        if (ty == 0xFF && el >= 7) {
-                            uint16_t cid = rep[11+di] | (rep[12+di] << 8);
-                            uint16_t vid = rep[13+di] | (rep[14+di] << 8);
-                            uint16_t pid = rep[15+di] | (rep[16+di] << 8);
-                            if (cid == 0x0553 && vid == 0x057E && pid == 0x2069) {
-                                char a[18]; ba2str((bdaddr_t *)peer, a);
-                                fprintf(stderr, "  Found: %s type=%s (Nintendo cid=0x%04x vid=0x%04x pid=0x%04x)\n",
-                                        a, addr_type_name(atype), cid, vid, pid);
-                                peer_type = atype;
-                                found = 1;
-                                break;
-                            }
-                        }
-                        di += 1 + el;
-                    }
-                    if (found) break;
-                    off += 10 + dlen;
-                }
-            }
-            hci_le_set_scan_enable(scan_fd, 0x00, 0x00, 1000);
-            setsockopt(scan_fd, SOL_HCI, HCI_FILTER, &of, sizeof(of));
-            close(scan_fd);
-
-            if (!found) {
-                fprintf(stderr, "No Switch 2 controller found in scan.\n");
-                if (scan_only) return 1;
-            }
-        }
-
-        /* Bring hci0 back DOWN for USER channel */
-        system("hciconfig hci0 down 2>/dev/null");
-        usleep(200000);
-
-        if (addr_is_zero(peer)) {
-            fprintf(stderr, "ERROR: no peer address found\n");
-            return 1;
-        }
-        char a[18]; ba2str((bdaddr_t *)peer, a);
-        fprintf(stderr, "peer: %s type=%s\n", a,
-                addr_type_name(peer_type));
-        if (scan_only) return 0;
-    }
-
     /* ═══════════════════════════════════════════════════════════════
      * TRANSPORT: Open HCI_CHANNEL_USER socket
      *   hci_user_open() brings hci0 DOWN via ioctl, opens USER socket
@@ -845,6 +871,28 @@ int main(int argc, char **argv) {
     if (hci_fd < 0) return 1;
 
     if (hci_user_init(hci_fd) < 0) {
+        hci_user_close(hci_fd);
+        return 1;
+    }
+
+    /* ── Auto-scan via the same USER socket used for connection ───── */
+    if (auto_scan && !bdaddr_s) {
+        if (scan_for_peer_user(hci_fd, peer, &peer_type, own_type,
+                               scan_timeout, verbose) < 0) {
+            hci_user_close(hci_fd);
+            return 1;
+        }
+        char a[18];
+        ba2str((bdaddr_t *)peer, a);
+        fprintf(stderr, "peer: %s type=%s\n", a, addr_type_name(peer_type));
+        if (scan_only) {
+            hci_user_close(hci_fd);
+            return 0;
+        }
+    }
+
+    if (addr_is_zero(peer)) {
+        fprintf(stderr, "ERROR: no peer address found\n");
         hci_user_close(hci_fd);
         return 1;
     }
