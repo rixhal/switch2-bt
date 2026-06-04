@@ -526,10 +526,15 @@ static int rx_await(session_t *s, uint8_t evt, uint8_t sub,
             }
             /* Extract conn_handle from LE Connection Complete */
             if (f.evt_code == EVT_LE_META && f.subevent == EVT_LE_CONN_COMPLETE &&
-                f.payload_len >= 18 && f.payload[1] == 0x00) {
-                s->conn_handle = get_le16(f.payload + 3) & 0x0fff;
-                fprintf(stderr, "  [rx] LE_CONN_COMPLETE handle=0x%04x interval=%.2fms\n",
-                        s->conn_handle, get_le16(f.payload + 14) * 1.25);
+                f.payload_len >= 18) {
+                uint8_t st = f.payload[1];
+                if (st == 0x00) {
+                    s->conn_handle = get_le16(f.payload + 3) & 0x0fff;
+                    fprintf(stderr, "  [rx] LE_CONN_COMPLETE handle=0x%04x interval=%.2fms\n",
+                            s->conn_handle, get_le16(f.payload + 14) * 1.25);
+                } else {
+                    fprintf(stderr, "  [rx] LE_CONN_COMPLETE FAILED status=0x%02x\n", st);
+                }
             }
             /* Check if this matches our awaited event */
             int match = 0;
@@ -895,9 +900,8 @@ int main(int argc, char **argv) {
                         uint8_t el = rep[9 + di], ty = rep[10 + di];
                         if (!el || di + 1 + (int)el > dlen) break;
                         if (ty == 0xFF && el >= 3) {
-                            uint16_t cid = rep[11 + di] |
-                                           (rep[12 + di] << 8);
-                            if (cid == 0x057E) {
+                            uint16_t cid = rep[11+di] | (rep[12+di] << 8);
+                            if (cid == 0x057E || cid == 0x0553) {
                                 char a[18];
                                 ba2str((bdaddr_t *)peer, a);
                                 fprintf(stderr,
