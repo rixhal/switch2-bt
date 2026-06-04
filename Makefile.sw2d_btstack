@@ -1,0 +1,28 @@
+# Makefile for sw2d_btstack - Switch 2 Pro Controller BLE HID Host
+# Links against BTstack posix-h4
+
+BTSTACK_ROOT ?= $(HOME)/btstack
+
+SW2D_SRC = $(HOME)/switch2-raw/sw2d_btstack.c
+SW2D_CFG = $(HOME)/switch2-raw/btstack_config.h
+
+all: sw2d_btstack
+
+sw2d_btstack:
+	# Copy config and source to BTstack posix-h4 directory
+	cp $(SW2D_CFG) $(BTSTACK_ROOT)/port/posix-h4/btstack_config.h
+	cp $(SW2D_SRC) $(BTSTACK_ROOT)/port/posix-h4/sw2d_btstack.c
+	# Patch Makefile to build sw2d_btstack instead of example
+	cd $(BTSTACK_ROOT)/port/posix-h4 && \
+	  sed -i 's/^EXECUTABLE_NAME.*/EXECUTABLE_NAME = sw2d_btstack/' Makefile && \
+	  sed -i 's|^CORE +=.*main.c|CORE += sw2d_btstack.c|' Makefile && \
+	  $(MAKE) CC=$(CROSS_COMPILE)gcc
+	cp $(BTSTACK_ROOT)/port/posix-h4/sw2d_btstack $(HOME)/switch2-raw/sw2d_btstack
+
+clean:
+	rm -f $(HOME)/switch2-raw/sw2d_btstack
+
+deploy: sw2d_btstack
+	scp $(HOME)/switch2-raw/sw2d_btstack root@10.10.10.140:/storage/switch2-bt/sw2d_btstack
+
+.PHONY: all clean deploy
