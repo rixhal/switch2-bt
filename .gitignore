@@ -1,30 +1,36 @@
+# Build artifacts
 *.o
+*.d
 *.ko
 *.mod
 *.mod.c
 *.mod.o
-Module.symvers
 modules.order
-.*.cmd
-switch2-bt
-hid_desc.bin
-# compiled binaries
-sw2d
-sw2d_final
-sw2d_lib
-hciletest
-acltest
-hciraw
-hciraw2
-hciraw3
-hcisend
-hcisend2
-hcitest
-gattdump
-sw2rawd
-l2test_c
-# test binaries
-test_args
-test_bdaddr
-test_adv_parse
-PROMPT.md
+Module.symvers
+
+# Binaries
+switch2_btstack_bridge
+usb_inspect*
+*.bin
+
+# Build dirs
+btstack_build/*.o
+btstack_build/*.d
+btstack_build/switch2_btstack_bridge
+
+# IDE
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup
+*.bak*
