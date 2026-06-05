@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-switch2d.py — Nintendo Switch 2 Pro Controller Linux Wireless Daemon (v4.0)
+switch2d.py — Nintendo Switch 2 Pro Controller Linux Wireless Daemon (v4.2)
 
-BlueZ/bleak → GATT init → uinput gamepad. Reconnect loop, structured
-stage logging, diagnostic mode, systemd-ready.
+BlueZ/bleak → notify subscription → uinput gamepad. Reconnect loop,
+structured stage logging, diagnostic mode with JSON summary, systemd-ready.
+
+Reference implementations (verified WORKING on their platforms):
+  - SPro2Win (Windows): byte-level parsing, handle 45, subscribe-all
+  - switch2bridge-macos (macOS): UUID 7492866c, PID-byte matching
 
 Usage:
-  python3 switch2d.py --diagnose              # verify everything works, then exit
-  python3 switch2d.py --daemon                # run forever with reconnect
-  python3 switch2d.py --max-reports 0         # infinite reports (no limit)
+  python3 switch2d.py --diagnose --verbose --json   # verify + JSON summary
+  python3 switch2d.py --daemon                       # run forever with reconnect
+  python3 switch2d.py --max-reports 0               # infinite reports (no limit)
   python3 switch2d.py --address E0:EF:BF:3B:C6:76 --verbose
 
 Stage exit codes:
@@ -16,10 +20,15 @@ Stage exit codes:
   11 — Scan: no controller found
   12 — Connect: BLE connection failed
   13 — Discover: required GATT characteristics missing
-  14 — Init: ProCon2 init sequence failed
-  15 — Subscribe: notification subscription failed
+  14 — Init: ProCon2 init sequence failed (only with --init)
+  15 — Subscribe: notification subscription failed or zero reports
   16 — Running: disconnected unexpectedly
   0  — Diagnose: all stages passed, reports received
+
+⚠️ STATUS: Awaiting hardware validation. The daemon compiles and passes 107
+   unit tests but has NOT been tested with the actual Switch 2 Pro Controller
+   on a Raspberry Pi. Do not claim wireless working until a real hardware run
+   is documented.
 """
 
 from __future__ import annotations
@@ -274,6 +283,11 @@ class DaemonState:
     disconnect_event: asyncio.Event = field(default_factory=asyncio.Event)
     notify_event: asyncio.Event = field(default_factory=asyncio.Event)
 
+    # Diagnostic tracking
+    first_report_hex: Optional[str] = None
+    last_report_hex: Optional[str] = None
+    jsonl_file: Any = None
+
     # uinput
     uinput: Any = None
 
@@ -345,8 +359,10 @@ async def stage_preflight(state: DaemonState) -> bool:
 # ── Stage: Scan ────────────────────────────────────────────────
 
 async def stage_scan(state: DaemonState) -> bool:
-    """BLE scan for Nintendo Switch 2 controller."""
-    state.log.stage("scan", "start", timeout=state.args.scan_timeout)
+    """BLE scan for Nintendo Switch 2 Pro Controller (PID 0x2069 by default)."""
+    strict_pid = not state.args.loose_scan
+    state.log.stage("scan", "start", timeout=state.args.scan_timeout,
+                    strict_pid=strict_pid)
 
     address_filter = state.args.address
     found_device: Optional[BLEDevice] = None
@@ -366,7 +382,7 @@ async def stage_scan(state: DaemonState) -> bool:
         if not mfg_data and not nintendo_vid_data:
             return
 
-        # macOS bridge approach: check for PID bytes in Nintendo manufacturer data
+        # macOS bridge approach: check for PID bytes in manufacturer data
         if nintendo_vid_data and PRO_CONTROLLER2_PID_LE not in nintendo_vid_data:
             if not mfg_data:  # Nintendo VID but wrong PID → skip
                 return
@@ -374,6 +390,12 @@ async def stage_scan(state: DaemonState) -> bool:
         info = parse_manufacturer_data(mfg_data if mfg_data else nintendo_vid_data)
         vid = info.get("vendor_id")
         pid = info.get("product_id")
+
+        # Strict mode: only accept Pro Controller 2 (PID 0x2069)
+        if strict_pid and pid is not None and pid != PRO_CONTROLLER2_PID:
+            if state.args.verbose:
+                state.log.info(f"  skip {device.address} pid=0x{pid:04x} (not Pro Controller 2)")
+            return
 
         if not found_device:
             found_device = device
@@ -446,11 +468,20 @@ async def stage_discover(state: DaemonState) -> bool:
     max_attempts = state.args.gatt_retries
     for attempt in range(1, max_attempts + 1):
         try:
+            # Primary: direct .services access (fast, works on most backends)
             services = state.client.services
             if services:
                 break
         except Exception as e:
-            state.log.warn(f"GATT service access failed ({attempt}/{max_attempts}): {e}")
+            state.log.warn(f"GATT .services failed ({attempt}/{max_attempts}): {e}")
+        # Fallback: explicit get_services() call (works on some backends where .services doesn't)
+        try:
+            services = await state.client.get_services()
+            if services:
+                state.log.info("GATT services retrieved via get_services()")
+                break
+        except Exception:
+            pass
         if attempt < max_attempts:
             await asyncio.sleep(0.5)
 
@@ -608,6 +639,24 @@ def handle_report(state: DaemonState, data: bytes, handle: Optional[int] = None)
     state.total_reports += 1
     state.notify_event.set()
 
+    # Track first/last report for diagnostic summary
+    hex_str = data.hex()
+    if state.first_report_hex is None:
+        state.first_report_hex = hex_str
+    state.last_report_hex = hex_str
+
+    # JSONL dump
+    if state.jsonl_file:
+        record = {
+            "ts": round(time.monotonic() - state.start_time, 3),
+            "report": state.report_count,
+            "handle": handle,
+            "length": len(data),
+            "hex": hex_str,
+        }
+        state.jsonl_file.write(json.dumps(record) + "\n")
+        state.jsonl_file.flush()
+
     decoded = decode_report(data)
     if decoded:
         # Log
@@ -747,7 +796,8 @@ async def run_session(state: DaemonState) -> bool:
 
     state.log.stage("session", "ok", reports=state.report_count)
     await cleanup_client(state)
-    return True
+    # Zero reports after successful subscribe = failure
+    return state.report_count > 0
 
 
 async def cleanup_client(state: DaemonState) -> None:
@@ -799,15 +849,33 @@ async def reconnect_loop(state: DaemonState) -> int:
 # ── Diagnose Mode ──────────────────────────────────────────────
 
 async def diagnose_mode(state: DaemonState) -> int:
-    """Run one full session, print summary, then exit."""
+    """Run one full session, print JSON diagnostic summary, then exit."""
     state.log.stage("diagnose", "start")
 
     session_ok = await run_session(state)
 
-    state.log.stage("diagnose", "ok" if session_ok and state.report_count > 0 else "fail",
-                    session_ok=session_ok,
-                    reports=state.report_count,
-                    total_reports=state.total_reports)
+    # Build diagnostic summary
+    stages = {
+        "scan": state.device is not None,
+        "connect": state.client is not None and state.client.is_connected,
+        "discover": state.input_report_handle is not None,
+        "subscribe": True,  # reached only if subscribe succeeded
+        "reports": state.report_count > 0,
+        "uinput": state.uinput is not None,
+    }
+    summary = {
+        "exit_code": 0 if (session_ok and state.report_count > 0) else (15 if session_ok else 16),
+        "stages": stages,
+        "device": state.device.address if state.device else None,
+        "input_uuid": state.input_report_uuid,
+        "input_handle": state.input_report_handle,
+        "report_count": state.report_count,
+        "first_report_hex": state.first_report_hex,
+        "last_report_hex": state.last_report_hex,
+    }
+
+    # Always print JSON summary on stdout as final output
+    print(json.dumps(summary, indent=2), flush=True)
 
     if session_ok and state.report_count > 0:
         state.log.info("DIAGNOSE PASSED: connection + reports working")
@@ -865,6 +933,8 @@ Examples:
                    help="BLE scan duration in seconds (default: 10)")
     p.add_argument("--address", type=str, default=None,
                    help="Filter scan to specific BDADDR")
+    p.add_argument("--loose-scan", action="store_true", default=False,
+                   help="Accept any Nintendo device (default: PID 0x2069 only)")
 
     # Connect
     p.add_argument("--connect-retries", type=int, default=3,
@@ -887,6 +957,8 @@ Examples:
     # Reports
     p.add_argument("--max-reports", type=int, default=100,
                    help="Max reports before exit (0=unlimited, default: 100)")
+    p.add_argument("--dump-jsonl", type=str, default=None,
+                   help="Save all received reports to JSONL file (for hardware golden runs)")
 
     # uinput
     p.add_argument("--uinput", action="store_true", default=False,
@@ -931,6 +1003,12 @@ async def async_main() -> int:
         if args.diagnose:
             return 10
 
+    # Open JSONL file if requested
+    if args.dump_jsonl:
+        jsonl_path = Path(args.dump_jsonl)
+        state.jsonl_file = jsonl_path.open("w")
+        log.info(f"Writing reports to {jsonl_path}")
+
     try:
         if args.diagnose:
             return await diagnose_mode(state)
@@ -954,6 +1032,12 @@ async def async_main() -> int:
         if state.uinput:
             try:
                 state.uinput.close()
+            except Exception:
+                pass
+        # Close JSONL file
+        if state.jsonl_file:
+            try:
+                state.jsonl_file.close()
             except Exception:
                 pass
         await cleanup_client(state)
