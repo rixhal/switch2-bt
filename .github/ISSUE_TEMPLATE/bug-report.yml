@@ -1,0 +1,68 @@
+name: Bug Report
+description: Report a failure at any pipeline stage.
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Failure stage
+      description: "Which pipeline stage failed?"
+      options:
+        - preflight
+        - scan
+        - connect
+        - discover
+        - subscribe
+        - reports
+        - uinput
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command used
+      description: "The exact command line that was run."
+      placeholder: |
+        sudo python3 switch2d.py --diagnose --profile auto --verbose
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: "What should have happened?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: "What happened instead? Paste error output, exit code, stage logs."
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Full diagnostic output, btmon capture, or journalctl -u bluetooth excerpt."
+      render: text
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Hardware, OS, kernel, BlueZ version, bleak version.
+        Run: uname -r && bluetoothd --version && pip show bleak | grep Version
+      placeholder: |
+        Raspberry Pi 5, LibreELEC 13
+        Kernel 6.12.56
+        BlueZ 5.73
+        bleak 0.22.0

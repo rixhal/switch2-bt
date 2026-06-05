@@ -1,0 +1,106 @@
+name: Hardware Test Report
+description: Submit a golden-run diagnostic from switch2d.py on real hardware.
+title: "[HW] "
+labels: ["hardware-test"]
+body:
+  - type: input
+    id: controller
+    attributes:
+      label: Controller
+      description: "e.g. Nintendo Switch 2 Pro Controller (PID 0x2069)"
+      placeholder: "Switch 2 Pro Controller"
+    validations:
+      required: true
+
+  - type: input
+    id: pi-model
+    attributes:
+      label: Raspberry Pi model
+      description: "e.g. Raspberry Pi 5, Raspberry Pi 4"
+      placeholder: "Raspberry Pi 5"
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: "e.g. LibreELEC 13, Debian 12 Bookworm"
+      placeholder: "LibreELEC 13"
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: "uname -r"
+      placeholder: "6.12.56"
+
+  - type: input
+    id: bluez-version
+    attributes:
+      label: BlueZ version
+      description: "bluetoothd --version"
+      placeholder: "5.73"
+
+  - type: input
+    id: bleak-version
+    attributes:
+      label: bleak version
+      description: "pip show bleak | grep Version"
+      placeholder: "0.22.0"
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command used
+      description: "The exact command line that was run."
+      placeholder: |
+        sudo python3 switch2d.py \
+          --diagnose \
+          --profile auto \
+          --uinput \
+          --dump-jsonl golden_run.jsonl \
+          --verbose
+      render: bash
+    validations:
+      required: true
+
+  - type: input
+    id: profile
+    attributes:
+      label: Profile used
+      description: "auto, macos, spro2win, or joycon2cpp"
+      placeholder: "auto"
+
+  - type: input
+    id: exit-code
+    attributes:
+      label: Exit code
+      description: "The process exit code (0 = success)."
+      placeholder: "0"
+
+  - type: textarea
+    id: json-summary
+    attributes:
+      label: Final diagnostic JSON summary
+      description: "Paste the JSON output printed at the end of the run."
+      render: json
+
+  - type: textarea
+    id: btmon-log
+    attributes:
+      label: btmon capture (optional)
+      description: "Paste a relevant excerpt from btmon_golden_run.log, or attach the file."
+      render: text
+
+  - type: textarea
+    id: journalctl
+    attributes:
+      label: journalctl -u bluetooth excerpt (optional)
+      description: "Relevant bluetoothd log lines during the test."
+      render: text
+
+  - type: textarea
+    id: golden-run-jsonl
+    attributes:
+      label: golden_run.jsonl attachment note
+      description: "Attach the golden_run.jsonl file if available."
+      render: text

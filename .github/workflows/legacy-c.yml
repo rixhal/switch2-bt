@@ -1,0 +1,30 @@
+name: Legacy C Build
+
+on:
+  workflow_dispatch:
+    # Manual trigger only — this is preserved for reference.
+    # The active development path is switch2d.py (Python CI).
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libbluetooth-dev
+
+      - name: Build legacy raw-HCI programs
+        run: make
+        continue-on-error: true
+
+      - name: Build legacy tools
+        run: make tools
+        continue-on-error: true
+
+      - name: Build and run legacy tests
+        run: make test
+        continue-on-error: true
