@@ -9,6 +9,37 @@ Pi 4/5 or any BlueZ-capable host).
 
 ---
 
+## OS Preflight (run once before testing)
+
+```bash
+sudo ./scripts/os-preflight.sh
+```
+
+This script brings the Bluetooth adapter and `/dev/uinput` into a known-good state:
+
+1. Unblocks Bluetooth via `rfkill`
+2. Restarts `bluetooth.service`
+3. Powers on the adapter via `bluetoothctl`
+4. Loads the `uinput` kernel module
+5. Prints adapter info (`hciconfig -a` or `bluetoothctl show`)
+6. Verifies `/dev/uinput` exists
+7. Prints the suggested golden-run command
+
+**No command fails hard** — optional tools (`rfkill`, `hciconfig`) are skipped
+if missing. Run this before every hardware test session.
+
+To capture raw HCI traffic for debugging, run in a separate terminal before
+starting `switch2d.py`:
+
+```bash
+sudo ./scripts/capture-btmon.sh
+```
+
+This records everything the Bluetooth adapter sends/receives to
+`btmon_golden_run.log`. Ctrl+C to stop after the test.
+
+---
+
 ## Run Modes
 
 ```

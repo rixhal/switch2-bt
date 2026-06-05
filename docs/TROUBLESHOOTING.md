@@ -12,6 +12,12 @@ checklist. See [README.md](../README.md) for project overview and all CLI flags.
 **Symptom:** `stage_scan` returns ❌ with `reason=no Nintendo controller found`.
 
 **Diagnosis:**
+- Run the OS preflight first to ensure Bluetooth is in a clean state:
+
+```bash
+sudo ./scripts/os-preflight.sh
+```
+
 - Is the controller in pairing/advertising mode? LEDs must be cycling.
 - Hold the SYNC button (small recessed button on top edge) for 3+ seconds until
   the home-button LEDs start blinking.
@@ -26,12 +32,19 @@ sudo bluetoothctl scan le
 sudo hcitool lescan
 ```
 
+- Check bluetoothd logs for scan-related errors:
+
+```bash
+journalctl -u bluetooth -f  # run during scan attempt
+```
+
 **Fix:**
 1. Hold SYNC button firmly until LEDs cycle.
 2. Try USB-init: plug controller into Switch 2 dock or PC via USB-C briefly,
    unplug, then SYNC.
-3. Increase scan timeout: `--scan-timeout 30`
-4. If `bluetoothctl scan le` also shows nothing, the host Bluetooth adapter or
+3. Try `--loose-scan` (accepts any Nintendo device, not just Pro Controller 2).
+4. Increase scan timeout: `--scan-timeout 30`
+5. If `bluetoothctl scan le` also shows nothing, the host Bluetooth adapter or
    antenna may be the problem — not the controller.
 
 ---
@@ -221,6 +234,12 @@ bluetoothctl
 Controller" device.
 
 **Diagnosis:**
+- Run the OS preflight. Step 4 loads uinput, step 6 verifies it:
+
+```bash
+sudo ./scripts/os-preflight.sh
+```
+
 - Is the `uinput` kernel module loaded?
 
 ```bash
@@ -243,7 +262,7 @@ ls -la /dev/uinput
 
 **Fix:**
 1. Load uinput: `sudo modprobe uinput`
-2. Run as root: `sudo python3 switch2d.py --uinput ...`
+2. Always run with sudo: `sudo python3 switch2d.py --uinput ...`
 3. Add a udev rule for persistent permissions (see below).
 4. Check for conflicts: if another uinput device with the same name exists, the
    new one may not be created. Run `evtest` without args to list all devices.
