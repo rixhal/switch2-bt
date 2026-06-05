@@ -379,9 +379,11 @@ class DaemonState:
 
 async def stage_preflight(state: DaemonState) -> bool:
     state.log.stage("preflight", "start")
+    # Check bleak
     try:
         import bleak
-        state.log.info(f"bleak {bleak.__version__}")
+        ver = getattr(bleak, "__version__", "unknown")
+        state.log.info(f"bleak {ver}")
     except Exception:
         state.log.error("bleak not available")
         return False
@@ -763,7 +765,7 @@ def setup_uinput(state: DaemonState) -> bool:
             name="Nintendo Switch 2 Pro Controller",
             vendor=NINTENDO_VID, product=PRO_CONTROLLER2_PID, version=1,
         )
-        state.log.stage("uinput", "ok", name="Nintendo Switch 2 Pro Controller")
+        state.log.stage("uinput", "ok", dev_name="Nintendo Switch 2 Pro Controller")
         return True
     except Exception as e:
         state.log.error(f"uinput setup failed: {e}")
