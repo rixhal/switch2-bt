@@ -1,20 +1,56 @@
-# SMP Encryption Research — Automated Farming
+# SMP Encryption Research — Automated Farming (Session 2)
 **Date:** 2026-06-05
 **Researched by:** Hermes Enterprise (cron job)
-**Sources:** web_search (8 searches, 42 results), GitHub raw source code extraction, Nadeflore switch2-controllers reverse engineering
+**Sessions:** 2 automated farming runs consolidated below
+**Sources:** web_search (14 queries), GitHub raw source extraction, leonsnotes.ca full article, Nadeflore switch2-controllers, CareyScott switch2controllerpc, BTstack upstream code
 
 ---
 
-## 🚨 CRITICAL FINDING: Switch 2 Uses Proprietary GATT Pairing, NOT SMP
+## 🚨 CRITICAL FINDING (from Session 1): Switch 2 Uses Proprietary GATT Pairing, NOT SMP
 
 **The Switch 2 Pro Controller does NOT use standard BLE SMP pairing.** Our entire approach of trying to complete SMP encryption is on the wrong protocol layer. The controller uses a Nintendo-proprietary command protocol over GATT.
 
 ### Evidence
 - **Source:** [Nadeflore/switch2-controllers](https://github.com/Nadeflore/switch2-controllers) — reverse-engineered Switch 2 controller protocol
 - **Source:** [CareyScott/switch2controllerpc](https://github.com/CareyScott/switch2controllerpc) — Windows app using the protocol
-- **File:** `controller.py` lines 30-53, 306-384 — complete pairing flow
+- **Source:** [Leon's Notes](https://leonsnotes.ca/2026/04/04/reverse-engineering-the-switch-2-pro-controllers-bluetooth-protocol/) — Full reverse engineering writeup (Apr 4, 2026)
+- **Source:** [BlueRetro Issue #1249](https://github.com/darthcloud/BlueRetro/issues/1249) — Switch 2 GATT service structure
 
-### Switch 2 GATT Characteristics (from reverse engineering)
+---
+
+## 🔥 NEW FINDING (Session 2): Connection Interval Violation — Silent Connection Failure
+
+### The Switch 2 Console Uses Interval=4 (5ms) — Below BLE Spec Minimum of 6 (7.5ms)
+
+**From Leon's Notes:** "Nintendo's console operates below the Bluetooth spec minimum. Every spec-compliant BLE stack — NimBLE, Zephyr, presumably others — silently rejects this. The connection is accepted at the radio, handed up one layer, and quietly dropped because the interval fails a bounds check. No error, no log. Just silence."
+
+**This means:**
+1. Even if the Switch 2 *console* initiates a connection from the home screen, our peripheral device must accept interval=4
+2. Standard BTstack also validates connection intervals — we may need to override this
+3. Home screen auto-connect fails silently because the controller rejects the connection parameters
+4. "Change Grip/Order" menu works because it uses different connection parameters
+
+### Implications for Our Pi Setup
+- BTstack's `gap_set_connection_parameters()` may get rejected by the controller if the Switch 2 host proposes interval < 6
+- Same issue with NimBLE/Zephyr: `ull_peripheral.c` rejects interval < 6
+- Fix: In Zephyr, change `CONN_INTERVAL_MIN` constant; in BTstack, check if `hci.c` or `gap.c` has interval validation
+
+---
+
+## 🔥 NEW FINDING (Session 2): The 0x15 Subcommand is a Hardcoded LTK — Can't Be Generated
+
+**From Leon's Notes:** "There's one part of the protocol I never cracked — subcommand 0x15 handles the initial key exchange. This establishes the shared encryption key (LTK) between controller and console. My emulator sidesteps this entirely by extracting the MAC address and LTK from an already-paired real controller and loading them into the microcontroller."
+
+**Key points:**
+- The LTK is stored on the controller's SPI flash AFTER pairing with a real Switch 2
+- The pairing computation happens inside the controller's firmware — not on the network
+- 0x15 subcommand triggers this firmware computation
+- Result: Every emulator needs a donor controller (MAC + LTK extracted)
+- Hardcoded LTKs in Nadeflore's code (PAIR_LTK1, PAIR_LTK2) are from a specific paired session
+
+---
+
+## Switch 2 GATT Characteristics (from reverse engineering)
 ```
 INPUT_REPORT_UUID    = "ab7de9be-89fe-49ad-828f-118f09df7fd2"  ✅ matches ours
 COMMAND_WRITE_UUID   = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"  ✅ matches ours
@@ -22,7 +58,20 @@ COMMAND_RESPONSE_UUID = "c765a961-d9d8-4d36-a20a-5315b111836a"  ⚠️ we need t
 VIBRATION_WRITE_PRO  = "cc483f51-9258-427d-a939-630c31f72b05"
 ```
 
-### Nintendo Advertising Format
+### Connection Handle Mapping (from Leon's Notes)
+- Console writes commands on **handle 0x0016** (not necessarily 0x0014)
+- Controller responds via notifications on **handle 0x001a**
+- Console addresses characteristics by **handle number, not UUID** — handles must match exactly
+- 14 characteristics across 2 custom GATT services, all behind 128-bit UUIDs
+
+### Input Report Format (from Leon's sniffer)
+- Input report type byte = **0x20** (NOT 0x0d which is the original Pro Controller)
+- Input reports flow at **200Hz** on real controller (one per 5ms connection event)
+- Activation response is **16 bytes** (not 9)
+
+---
+
+## Switch 2 Advertising Format
 ```
 Manufacturer ID: 0x0553 (not USB VID 0x057e)
 Manufacturer Data:
@@ -36,22 +85,31 @@ Manufacturer Data:
             - matches host MAC = already paired → skip pairing
 ```
 
-### Switch 2 Pairing Protocol (Custom GATT Commands)
+### Switch 2 Controller PID Values
+```
+JOYCON2_RIGHT_PID       = 0x2066
+JOYCON2_LEFT_PID        = 0x2067
+PRO_CONTROLLER2_PID     = 0x2069
+NSO_GAMECUBE_CONTROLLER = 0x2073
+```
+
+---
+
+## Switch 2 Pairing Protocol (Custom GATT Commands)
 ```
 COMMAND_PAIR = 0x15
 
 Step 1: SUBCOMMAND_PAIR_SET_MAC (0x01)
   Data: 0x00 0x02 + host_mac(6LE) + host_mac(6LE)
-  Sets the host MAC address (Switch 2 sends two copies — 
-  Switch console has 2 BT adapters)
+  Sets the host MAC address
 
 Step 2: SUBCOMMAND_PAIR_LTK1 (0x04)
   Data: 0x00 ea bd 47 13 89 35 42 c6 79 ee 07 f2 53 2c 6c 31
-  Hardcoded! Same for all controllers
+  Hardcoded LTK from a specific donor controller session
 
 Step 3: SUBCOMMAND_PAIR_LTK2 (0x02)
   Data: 0x00 40 b0 8a 5f cd 1f 9b 41 12 5c ac c6 3f 38 a0 73
-  Hardcoded! Same for all controllers
+  Hardcoded LTK from a specific donor controller session
 
 Step 4: SUBCOMMAND_PAIR_FINISH (0x03)
   Data: 0x00
@@ -66,58 +124,42 @@ command_buffer = cmd_id + b"\x91\x01" + subcmd_id + b"\x00" + len(data) + b"\x00
 
 # Response comes on COMMAND_RESPONSE_UUID (notification):
 # [cmd_id(1)] [0x01] [subcmd(1)] [0x00] [len(1)] [0x00 0x00] [response_data(N)]
-# Check: response[0] == cmd_id and response[1] == 0x01
 ```
 
-### Connection Flow (from discoverer.py)
-1. Scan for BLE advertisements with Nintendo manufacturer ID (0x0553)
-2. Connect via BLE (standard GATT connection — NO SMP pairing needed!)
-3. Read COMMAND_RESPONSE_UUID notifications
-4. Check reconnect_mac in advertisement:
-   - If 0 → controller in pairing mode: run `pair()` protocol
-   - If matches host MAC → already paired: skip pairing
-5. Read controller info via memory read (COMMAND_MEMORY)
-6. Enable INPUT_REPORT_UUID notifications → input data flows!
+### 19-Step Activation Sequence (from Leon's Sniffer)
+1. Console reads device info
+2. Pulls calibration data from virtual SPI flash
+3. Configures various settings
+4. Sends activation command
+5. Heartbeats begin after activation accepted
+
+Every response is a hardcoded byte array. No session tokens, no nonces, no timestamps. Protocol is entirely deterministic.
 
 ---
 
-## BTstack-Specific Configuration (What We Should Be Doing)
+## BTstack-Specific Configuration
 
-### Correct Approach for BTstack Central Role
-The Switch 2 controller does NOT require SMP encryption to communicate. The `write_command` on the bleak Python library succeeds because the OS Bluetooth stack (WinRT on Windows, BlueZ on Linux) handles whatever encryption handshake the controller needs — likely Just Works with the controller accepting any connection.
-
-**Our BTstack approach should:**
-1. Connect to controller via GAP LE (this works ✅)
-2. Do NOT initiate SMP pairing — it's not needed and causes issues
-3. Instead, send the Nintendo COMMAND_PAIR sequence over the command characteristic
-4. The controller's write permission may require link encryption — but this is handled at the HCI level, not SMP
-
-### Key BTstack APIs for GATT Client (Central Role)
+### ⚠️ Our Bridge Code Already Handles Encryption Change
+The existing `switch2_btstack_bridge.c` at line 408 has:
 ```c
-// From btstack_defines.h — SM events for reference
-#define SM_EVENT_PAIRING_STARTED          0xD4u
-#define SM_EVENT_PAIRING_COMPLETE         0xD5u  // status codes:
-                                                //   ERROR_CODE_SUCCESS
-                                                //   ERROR_CODE_CONNECTION_TIMEOUT
-                                                //   ERROR_CODE_AUTHENTICATION_FAILURE
-#define SM_EVENT_REENCRYPTION_STARTED     0xD6u
-#define SM_EVENT_REENCRYPTION_COMPLETE    0xD7u
+case HCI_EVENT_ENCRYPTION_CHANGE:
+    if (app_state == STATE_WAIT_ENCRYPTION) {
+        uint8_t enc_status = hci_event_encryption_change_get_status(packet);
+        bridge_log("Encryption change: 0x%02x — starting GATT", enc_status);
+        app_state = STATE_CHAR_DISCOVERING;
+        // ... starts GATT discovery
+    }
+```
 
-// Gap functions (from gap.h)
-void gap_secure_connections_enable(bool enable);  // NOTE: BR/EDR only!
-void gap_delete_bonding(bd_addr_type_t addr_type, bd_addr_t addr);
-void gap_drop_link_key_for_bd_addr(bd_addr_t addr);
+### Correct BTstack Approach
+BTstack bridge is already moving in the right direction: **NO SMP, proprietary GATT pair instead**.
 
-// SM setup (from sm_pairing_peripheral.c example)
+```c
+// BTstack APIs needed:
 sm_init();
 sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
-sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION);  // LE SC
-// OR for legacy:
-sm_set_secure_connections_only_mode(false);
-sm_set_authentication_requirements(0);  // Just Works, no SC
-
-// Event handlers
-sm_add_event_handler(&sm_event_callback_registration);  // SEPARATE handler!
+sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION);
+// sm_add_event_handler(&sm_event_callback_registration);  // SEPARATE handler
 hci_add_event_handler(&hci_event_callback_registration);
 
 // Auto-confirm Just Works
@@ -132,119 +174,86 @@ SM_EVENT_REENCRYPTION_COMPLETE     H1B1    handle, addr_type, addr, status
 SM_EVENT_IDENTITY_CREATED          H1B1B2  handle, addr_type, addr, id_addr_type, id_addr, index
 ```
 
----
-
-## Protocol Insights
-
-### Why SMP Was Failing
-1. **gap_secure_connections_enable() is for BR/EDR only** — it doesn't affect BLE LE Secure Connections at all
-2. For BLE LE SC, use `sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION)`
-3. The Switch 2 controller may accept SMP pairing but its primary mechanism is the proprietary command protocol
-4. The "Write Not Permitted (0x03)" error happens because the controller's GATT server requires link-layer encryption for the command characteristic, BUT the controller manages encryption as part of its proprietary pairing, not SMP
-
-### Bluetooth LE Security Levels
-- LEVEL_1: No security (open)
-- LEVEL_2: Encryption with unauthenticated pairing (Just Works)
-- LEVEL_3: Encryption with authenticated pairing (MITM)
-- LEVEL_4: LE Secure Connections with authenticated pairing
-
-The controller likely requires LEVEL_2 for command writes, achieved through its internal encryption handshake triggered by the PAIR commands, not SMP.
-
-### Switch 2 Controller PID Values
-```python
-JOYCON2_RIGHT_PID       = 0x2066
-JOYCON2_LEFT_PID        = 0x2067
-PRO_CONTROLLER2_PID     = 0x2069
-NSO_GAMECUBE_CONTROLLER = 0x2073
-```
+### 🔥 NEW: Check for Connection Interval Validation in BTstack
+If BTstack rejects connection intervals < 6 (like Zephyr/NimBLE), the Switch 2 console's interval=4 will cause SILENT connection rejection at home screen. Search BTstack source for `CONN_INTERVAL_MIN` or `interval_min` validation in `hci.c`, `gap.c`, or port layer.
 
 ---
 
 ## External Examples
 
-### BTstack sm_pairing_peripheral.c (canonical SMP example)
+### BTstack sm_pairing_peripheral.c (canonical)
 **File:** https://github.com/bluekitchen/btstack/blob/master/example/sm_pairing_peripheral.c
 
-Shows complete SMP event handling:
-- SM_EVENT_JUST_WORKS_REQUEST → `sm_just_works_confirm(handle)`
-- SM_EVENT_PAIRING_COMPLETE → check status codes
-- SM_EVENT_REENCRYPTION_COMPLETE → handle bonding info missing
-- SM_EVENT_IDENTITY_CREATED / RESOLVING_*
-
-Configuration examples for LE Legacy Just Works:
-```c
-sm_set_secure_connections_only_mode(false);
-sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
-sm_set_authentication_requirements(0);  // no bonding, no SC, no MITM
-```
+Complete SMP event handling in separate handlers — demonstrates correct API usage.
 
 ### Nadeflore switch2-controllers (ACTUAL WORKING IMPLEMENTATION)
 **Repo:** https://github.com/Nadeflore/switch2-controllers
-**File:** controller.py (467 lines)
+Complete implementation: BLE connection, Nintendo pairing protocol, input report parsing, vibration, LED control.
 
-This is the gold-standard reference. Complete implementation of:
-- BLE connection (via bleak/WinRT)
-- Nintendo pairing protocol (COMMAND_PAIR sequence)
-- Controller memory read (for calibration, serial number)
-- Input report parsing (buttons, sticks, gyro, accelerometer, magnometer, battery)
-- Vibration control
-- LED control
-- Feature enable (motion, mouse)
-
-### CareyScott switch2controllerpc (Packaged Windows App)
+### CareyScott switch2controllerpc
 **Repo:** https://github.com/CareyScott/switch2controllerpc
+Wraps Nadeflore code with ViGEmBus virtual controller.
 
-Wraps Nadeflore code with ViGEmBus virtual controller support. Uses the same GATT UUIDs and pairing protocol. Includes gyro mouse, Joy-Con split/merge.
+### Leon's Notes Reverse Engineering Writeup
+**URL:** https://leonsnotes.ca/2026/04/04/reverse-engineering-the-switch-2-pro-controllers-bluetooth-protocol/
+Full hardware/software reverse engineering of Switch 2 Pro Controller BLE protocol. nRF52840-based emulator.
 
-### Zephyr SMP Issues (for general SMP debugging reference)
-- [Zephyr #37228](https://github.com/zephyrproject-rtos/zephyr/issues/37228): SMP pairing never propagated to app layer → 30s timeout with unspecified failure
-- [Zephyr #41907](https://github.com/zephyrproject-rtos/zephyr/discussions/41907): Failing to reconnect to paired Just Works device
-- [Zephyr #4044](https://github.com/zephyrproject-rtos/zephyr/issues/4044): Livelock in SMP pairing failed scenario
+### BlueRetro Issue #1249
+**URL:** https://github.com/darthcloud/BlueRetro/issues/1249
+Community tracking of Switch 2 controller GATT service structure and connection behavior.
 
-Common SMP failure pattern: remote device (nRF5340) completes pairing/encryption at controller level but pairing success never reaches application layer → 30s disconnect.
+### ProCon2Tool
+**URL:** https://github.com/HandHeldLegend/handheldlegend.github.io/blob/master/procon2tool/index.html
+Web tool for reading Pro Controller 2 SPI flash layout and command structure.
+
+### Infineon: GATT Attribute Security Permissions in BLE
+**URL:** https://community.infineon.com/t5/Knowledge-Base-Articles/Handling-GATT-attribute-security-permissions-requirements-in-Bluetooth-LE/ta-p/289525
+"Read authentication required" / "Write authentication" means encryption OR authentication needed.
+
+### Zephyr Kconfig: Encryption-Change Event Optional
+**URL:** https://github.com/zephyrproject-rtos/zephyr/blob/main/subsys/bluetooth/host/Kconfig
+"Enabling this option will make the central role not require the encryption-change event to be received before..."
+
+---
+
+## 🔥 Connection Interval Fix Reference
+**Zephyr fix:** Change minimum connection interval constant in `subsys/bluetooth/controller/ll_sw/ull_peripheral.c` from 6 to 4.
+**NimBLE fix:** Same constant in NimBLE link layer.
+**BTstack:** Check `src/hci.c`, `src/gap.c`, and port layer for similar validation.
 
 ---
 
 ## Dead Ends Confirmed
 
-1. **SMP-based pairing is unnecessary** — The Switch 2 controller has its own pairing protocol over GATT
-2. **gap_secure_connections_enable() does NOT affect BLE** — it's for BR/EDR (Classic) only; use sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION) for LE SC
-3. **Trying to complete SMP encryption before sending PAIR commands** — Wrong order. The controller's proprietary pairing is what enables encryption, not SMP
-4. **SM_AUTHREQ_NO_BONDING with SC enabled** — Creates confusion; Just Works with NoInputNoOutput is best baseline
-5. **Forcing SC when controller may not support it** — The controller uses hardcoded LTK values, suggesting it doesn't do real SC key generation
-6. **Writing commands to 649d4ac9... before pairing** — Will always get Write Not Permitted; must send PAIR sequence first (the controller encrypts as part of this)
+1. **SMP-based pairing is unnecessary** — Switch 2 has proprietary GATT pairing
+2. **gap_secure_connections_enable() does NOT affect BLE** — BR/EDR only; use `sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION)` for LE SC
+3. **Trying to complete SMP encryption before sending PAIR commands** — Wrong order; controller's proprietary pairing enables encryption
+4. **SM_AUTHREQ_NO_BONDING with SC enabled** — Creates confusion
+5. **Forcing SC when controller may not support it** — Uses hardcoded LTKs, not real SC key generation
+6. **Writing commands before pairing** — Always gets Write Not Permitted (0x03)
+7. **Standard BLE Just Works pairing alone** — Controller doesn't complete; needs 0x15 subcommand sequences
+8. **Connection at home screen** — Fails silently if interval < 6 is rejected by our stack
 
 ---
 
-## Next Action: Immediate Code Change
+## Next Action: Immediate Code Changes
 
-**STOP trying to complete SMP encryption. Implement the Nintendo COMMAND_PAIR protocol instead:**
+### Priority 1: Complete the GATT Pair Command Sequence
+The bridge already transitions through `STATE_WAIT_ENCRYPTION` → `STATE_CHAR_DISCOVERING` → `STATE_PAIRING`. Ensure:
+1. Discover COMMAND_RESPONSE_UUID (`c765a961`) and subscribe to notifications
+2. Send all 4 PAIR commands in sequence
+3. Wait for response on each before proceeding
+4. Then enable INPUT_REPORT_UUID notifications
 
-### Step-by-step for BTstack:
-1. **Connect** via GAP LE (already working ✅)
-2. **Discover GATT characteristics** (already working ✅ — handles 0x000a input, 0x0014 cmd)
-3. **Also discover COMMAND_RESPONSE_UUID** (`c765a961-d9d8-4d36-a20a-5315b111836a`) and subscribe to notifications
-4. **Send PAIR sequence** via `gatt_client_write_value_of_characteristic_without_response()` to command handle:
-   ```
-   // PAIR SET MAC (host BDADDR = pi's hci1 address)
-   [0x15] [0x91 0x01] [0x01] [0x00] [0x0E] [0x00 0x00] [0x00 0x02] [host_mac_6LE] [host_mac_6LE]
-   
-   // PAIR LTK1
-   [0x15] [0x91 0x01] [0x04] [0x00] [0x11] [0x00 0x00] [0x00 ea bd 47 13 89 35 42 c6 79 ee 07 f2 53 2c 6c 31]
-   
-   // PAIR LTK2
-   [0x15] [0x91 0x01] [0x02] [0x00] [0x11] [0x00 0x00] [0x00 40 b0 8a 5f cd 1f 9b 41 12 5c ac c6 3f 38 a0 73]
-   
-   // PAIR FINISH
-   [0x15] [0x91 0x01] [0x03] [0x00] [0x01] [0x00 0x00] [0x00]
-   ```
-5. **Wait for responses** on COMMAND_RESPONSE_UUID notification
-6. **Then** enable INPUT_REPORT_UUID notification to get input data
-7. **Input report format**: See ControllerInputData class (60 bytes, starts with 4-byte timestamp, 4-byte buttons)
+### Priority 2: Check BTstack Connection Interval Validation
+Search BTstack source for interval minimum validation. If found and it rejects < 6, patch to allow interval=4 from Switch 2 console.
+
+### Priority 3: Handle Donor Controller Requirement
+Document that the hardcoded LTK values (PAIR_KEY_1, PAIR_KEY_2) need to match a specific paired session. Without a donor controller, we cannot generate these keys ourselves.
 
 ### After pairing succeeds:
 - Read controller info via COMMAND_MEMORY (address 0x00013000, size 0x40)
-- Enable features via COMMAND_FEATURE (0x0c): FEATURE_MOTION=0x04, FEATURE_MOUSE=0x10
+- Enable features: FEATURE_MOTION=0x04, FEATURE_MOUSE=0x10
 - Set LEDs via COMMAND_LEDS (0x09)
 
 ---
@@ -253,33 +262,47 @@ Common SMP failure pattern: remote device (nRF5340) completes pairing/encryption
 
 | # | URL | Description |
 |---|-----|-------------|
-| 1 | https://github.com/Nadeflore/switch2-controllers | **PRIMARY** — Original Switch 2 controller reverse engineering (Python/bleak) |
-| 2 | https://github.com/CareyScott/switch2controllerpc | Wrapped Windows app with ViGEmBus, same protocol |
-| 3 | https://raw.githubusercontent.com/Nadeflore/switch2-controllers/main/controller.py | Full controller.py source (467 lines) — pairing, commands, input parsing |
-| 4 | https://raw.githubusercontent.com/Nadeflore/switch2-controllers/main/discoverer.py | Discovery/pairing flow (109 lines) — ad parsing, reconnect_mac logic |
-| 5 | https://github.com/bluekitchen/btstack/blob/master/example/sm_pairing_peripheral.c | BTstack canonical SMP pairing example |
-| 6 | https://github.com/bluekitchen/btstack/blob/master/src/ble/sm.h | BTstack SM API header — all sm_* functions |
-| 7 | https://github.com/bluekitchen/btstack/blob/master/src/btstack_defines.h | BTstack event definitions incl. SM_EVENT_* and HCI_EVENT_ENCRYPTION_CHANGE |
-| 8 | https://github.com/bluekitchen/btstack/blob/master/src/gap.h | BTstack GAP functions: gap_secure_connections_enable, gap_delete_bonding |
-| 9 | https://github.com/bluekitchen/btstack/blob/master/src/hci.c | BTstack HCI layer — event handler registration order |
-| 10 | https://github.com/bluekitchen/btstack/blob/master/CHANGELOG.md | BTstack changelog — SM fixes, encryption changes |
-| 11 | https://bluekitchen-gmbh.com/btstack/examples/generated/ | BTstack example docs — GATT client setup |
-| 12 | https://bluekitchen-gmbh.com/btstack/protocols/ | BTstack protocol docs — SMP/encryption overview |
-| 13 | https://github.com/espressif/esp-idf/blob/master/examples/bluetooth/bluedroid/ble/gatt_security_server/tutorial/ | ESP-IDF GATT security tutorial — pairing events flow |
-| 14 | https://github.com/zephyrproject-rtos/zephyr/issues/37228 | Zephyr SMP bug: pairing complete not propagated to app |
-| 15 | https://github.com/zephyrproject-rtos/zephyr/discussions/41907 | Zephyr: failing to reconnect paired Just Works device |
-| 16 | https://stackoverflow.com/questions/78767932 | SO: Missing SMP packet for BLE pairing to finish |
-| 17 | https://stackoverflow.com/questions/62147384 | SO: Raspberry BLE encryption/pairing |
+| 1 | https://leonsnotes.ca/2026/04/04/reverse-engineering-the-switch-2-pro-controllers-bluetooth-protocol/ | **NEW SESSION 2** — Full hardware RE writeup: interval=4, 0x15 LTK, 19-step activation, nRF52840 emulator |
+| 2 | https://github.com/Nadeflore/switch2-controllers | PRIMARY — Original Switch 2 controller reverse engineering (Python/bleak) |
+| 3 | https://github.com/CareyScott/switch2controllerpc | Windows app with ViGEmBus, same protocol |
+| 4 | https://raw.githubusercontent.com/Nadeflore/switch2-controllers/main/controller.py | Full controller.py source (467 lines) |
+| 5 | https://raw.githubusercontent.com/Nadeflore/switch2-controllers/main/discoverer.py | Discovery/pairing flow (109 lines) |
+| 6 | https://github.com/bluekitchen/btstack/blob/master/example/sm_pairing_peripheral.c | BTstack canonical SMP pairing example — full source |
+| 7 | https://github.com/bluekitchen/btstack/blob/master/src/ble/sm.h | BTstack SM API header |
+| 8 | https://github.com/bluekitchen/btstack/blob/master/src/btstack_defines.h | BTstack event definitions |
+| 9 | https://github.com/bluekitchen/btstack/blob/master/src/gap.h | BTstack GAP functions |
+| 10 | https://github.com/bluekitchen/btstack/blob/master/src/hci.c | BTstack HCI layer |
+| 11 | https://github.com/bluekitchen/btstack/blob/master/CHANGELOG.md | BTstack changelog |
+| 12 | https://github.com/darthcloud/BlueRetro/issues/1249 | Switch 2 GATT service structure |
+| 13 | https://github.com/HandHeldLegend/handheldlegend.github.io/blob/master/procon2tool/index.html | ProCon2Tool — SPI flash layout |
+| 14 | https://github.com/MarcanBat2a/gamecube-remote-mac/blob/main/NSO_GC_BLE_PROTOCOL.md | NSO GC controller BLE protocol (related) |
+| 15 | https://github.com/zephyrproject-rtos/zephyr/blob/main/subsys/bluetooth/host/Kconfig | Zephyr encryption-change event optional |
+| 16 | https://community.infineon.com/t5/Knowledge-Base-Articles/Handling-GATT-attribute-security-permissions-requirements-in-Bluetooth-LE/ta-p/289525 | GATT security permissions for BLE |
+| 17 | https://groups.google.com/g/btstack-dev/c/N43oaguv7zg | BTstack-dev: LE Security Manager discussion |
+| 18 | https://github.com/espressif/esp-idf/blob/master/examples/bluetooth/bluedroid/ble/gatt_security_server/tutorial/ | ESP-IDF GATT security tutorial |
+| 19 | https://old.reddit.com/r/switch2/comments/1l42pe5/ | Reddit: Switch 2 Pro Controller PC connectivity |
+| 20 | https://github.com/zephyrproject-rtos/zephyr/issues/37228 | Zephyr SMP bug: pairing not propagated |
+| 21 | https://github.com/zephyrproject-rtos/zephyr/discussions/41907 | Zephyr: reconnect paired Just Works device |
+| 22 | https://stackoverflow.com/questions/78767932 | SO: Missing SMP packet for BLE pairing |
+| 23 | https://stackoverflow.com/questions/62147384 | SO: Raspberry BLE encryption/pairing |
+| 24 | https://device.report/m/575be3b618223159318f30e0d2d1a7d8a8cca1682d93599712bea00f4b370379 | BTstack POSIX H4 port — SM encryption events |
+| 25 | https://bluekitchen-gmbh.com/btstack/examples/generated/ | BTstack example docs |
+| 26 | https://bluekitchen-gmbh.com/btstack/protocols/ | BTstack protocol docs |
+| 27 | https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/ | Bluetooth Core 5.4 spec — Encryption Change event |
+| 28 | https://bluez-peripheral.readthedocs.io/en/stable/ref/gatt/characteristic.html | BlueZ GATT characteristic security |
+| 29 | https://bluekitchen-gmbh.com/btstack/examples/examples.html | BTstack examples index |
 
 ---
 
 ## Risk Assessment
 
 - **Risk Level:** Low (read-only protocol research)
-- **Impact:** Fundamental approach change needed — replace SMP pairing with Nintendo command protocol
-- **Effort:** Medium — new command state machine, command response handling, input report parsing
+- **Impact:** Fundamental approach confirmed — proprietary GATT pairing, not SMP
+- **New Risk (Session 2):** **Donor Controller Required** — The 0x15 LTK is hardcoded per controller session; cannot be generated without a real paired controller or firmware RE
+- **New Finding (Session 2):** **Connection Interval=4** — BTstack may silently reject connections from Switch 2 console at home screen; needs interval validation check and patch
+- **Effort:** Phase B bridge code already structured correctly — needs PAIR command completion + interval fix
 - **Urgency:** High — this unblocks the entire project
 
 ---
 
-*Generated automatically by Hermes Enterprise research farming cron job.*
+*Generated automatically by Hermes Enterprise research farming cron job (2 sessions consolidated).*
