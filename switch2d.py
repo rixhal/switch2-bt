@@ -287,6 +287,8 @@ class DaemonState:
     first_report_hex: Optional[str] = None
     last_report_hex: Optional[str] = None
     jsonl_file: Any = None
+    report_lengths: List[int] = field(default_factory=list)
+    report_timestamps: List[float] = field(default_factory=list)
 
     # Stage result flags — survive cleanup_client(), used for diagnostic summary
     stage_scan_ok: bool = False
@@ -294,6 +296,10 @@ class DaemonState:
     stage_discover_ok: bool = False
     stage_subscribe_ok: bool = False
     stage_reports_ok: bool = False
+
+    # SPro2Win mode tracking
+    spro2win_active: bool = False
+    spro2win_subscribe_count: int = 0
 
     # uinput
     uinput: Any = None
@@ -635,6 +641,8 @@ async def _subscribe_all_notify(state: DaemonState, handler) -> bool:
     if count == 0:
         state.log.stage("subscribe", "fail", reason="no notify characteristics found")
         return False
+    state.spro2win_active = True
+    state.spro2win_subscribe_count = count
     state.stage_subscribe_ok = True
     state.log.stage("subscribe", "ok", mode="subscribe-all", count=count)
     return True
@@ -652,6 +660,11 @@ def handle_report(state: DaemonState, data: bytes, handle: Optional[int] = None)
     state.total_reports += 1
     state.notify_event.set()
     state.stage_reports_ok = True
+
+    # Telemetry
+    now = time.monotonic()
+    state.report_lengths.append(len(data))
+    state.report_timestamps.append(now)
 
     # Track first/last report for diagnostic summary
     hex_str = data.hex()
@@ -863,12 +876,65 @@ async def reconnect_loop(state: DaemonState) -> int:
 # ── Diagnose Mode ──────────────────────────────────────────────
 
 async def diagnose_mode(state: DaemonState) -> int:
-    """Run one full session, print JSON diagnostic summary, then exit."""
+    """Run one full session with auto-notify-fallback, print JSON diagnostic summary."""
     state.log.stage("diagnose", "start")
 
     session_ok = await run_session(state)
 
-    # Build diagnostic summary from stage result flags — survive cleanup
+    # ── Auto-notify-fallback ──────────────────────────────────
+    # If we subscribed but got zero reports, try fallback UUIDs and subscribe-all
+    if (state.stage_subscribe_ok and not state.stage_reports_ok
+            and not state.args.spro2win and state.client and state.client.is_connected):
+        state.log.warn("auto-notify-fallback: subscribed OK but zero reports — trying fallbacks")
+
+        # Try each remaining UUID candidate
+        for fallback_uuid in INPUT_UUID_CANDIDATES:
+            if fallback_uuid == state.input_report_uuid:
+                continue
+            state.log.info(f"auto-notify-fallback: trying UUID {fallback_uuid[:36]}")
+            try:
+                await state.client.start_notify(fallback_uuid, _make_report_handler(state))
+                state.input_report_uuid = fallback_uuid
+                state.log.info(f"fallback subscribe to {fallback_uuid[:36]} OK")
+            except Exception as e:
+                state.log.warn(f"fallback subscribe failed: {e}")
+                continue
+
+            # Wait for reports
+            try:
+                await asyncio.wait_for(state.notify_event.wait(), timeout=state.args.notify_timeout)
+                if state.stage_reports_ok:
+                    state.log.info("auto-notify-fallback: reports received!")
+                    session_ok = True
+                    break
+            except asyncio.TimeoutError:
+                state.log.warn(f"fallback UUID {fallback_uuid[:36]}: still no reports")
+
+        # Last resort: subscribe-all
+        if not state.stage_reports_ok:
+            state.log.info("auto-notify-fallback: trying subscribe-all (SPro2Win-style)")
+            if await _subscribe_all_notify(state, _make_report_handler(state)):
+                try:
+                    await asyncio.wait_for(state.notify_event.wait(), timeout=state.args.notify_timeout)
+                except asyncio.TimeoutError:
+                    state.log.warn("subscribe-all: still no reports")
+
+    # ── Compute telemetry ────────────────────────────────────
+    intervals: List[float] = []
+    for i in range(1, len(state.report_timestamps)):
+        intervals.append((state.report_timestamps[i] - state.report_timestamps[i-1]) * 1000.0)
+
+    telemetry: Dict[str, Any] = {}
+    if state.report_lengths:
+        telemetry["length_min"] = min(state.report_lengths)
+        telemetry["length_max"] = max(state.report_lengths)
+        telemetry["length_avg"] = round(sum(state.report_lengths) / len(state.report_lengths), 1)
+    if intervals:
+        telemetry["interval_min_ms"] = round(min(intervals), 1)
+        telemetry["interval_max_ms"] = round(max(intervals), 1)
+        telemetry["interval_avg_ms"] = round(sum(intervals) / len(intervals), 1)
+
+    # ── Build diagnostic summary ─────────────────────────────
     stages = {
         "scan": state.stage_scan_ok,
         "connect": state.stage_connect_ok,
@@ -877,7 +943,7 @@ async def diagnose_mode(state: DaemonState) -> int:
         "reports": state.stage_reports_ok,
         "uinput": state.uinput is not None,
     }
-    summary = {
+    summary: Dict[str, Any] = {
         "exit_code": 0 if (session_ok and state.report_count > 0) else (15 if session_ok else 16),
         "stages": stages,
         "device": state.device.address if state.device else None,
@@ -886,7 +952,13 @@ async def diagnose_mode(state: DaemonState) -> int:
         "report_count": state.report_count,
         "first_report_hex": state.first_report_hex,
         "last_report_hex": state.last_report_hex,
+        "telemetry": telemetry,
     }
+    if state.spro2win_active:
+        summary["spro2win"] = {
+            "active": True,
+            "subscribe_count": state.spro2win_subscribe_count,
+        }
 
     # Always print JSON summary on stdout as final output
     print(json.dumps(summary, indent=2), flush=True)
@@ -900,6 +972,13 @@ async def diagnose_mode(state: DaemonState) -> int:
     else:
         state.log.error("DIAGNOSE FAILED: see stage errors above")
         return 16
+
+
+def _make_report_handler(state: DaemonState):
+    """Create a report handler closure — used by auto-notify-fallback."""
+    def handler(sender, data: bytearray):
+        handle_report(state, bytes(data), getattr(sender, "handle", None))
+    return handler
 
 
 # ── Signal Handling ────────────────────────────────────────────
