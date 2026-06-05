@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-switch2d.py — Nintendo Switch 2 Pro Controller Linux Wireless Daemon (v4.2)
+switch2d.py — Nintendo Switch 2 Pro Controller Linux Wireless Daemon (v5.0)
 
-BlueZ/bleak → notify subscription → uinput gamepad. Reconnect loop,
-structured stage logging, diagnostic mode with JSON summary, systemd-ready.
+Protocol profile system based on three documented working implementations:
+  - macOS:  switch2bridge-macos (UUID 7492866c, selected notify)
+  - SPro2Win: SquareDonut1/SPro2Win (subscribe-all, handle 45)
+  - joycon2cpp: TheFrano/joycon2cpp (init writes, UUID ab7de9be)
 
-Reference implementations (verified WORKING on their platforms):
-  - SPro2Win (Windows): byte-level parsing, handle 45, subscribe-all
-  - switch2bridge-macos (macOS): UUID 7492866c, PID-byte matching
+BlueZ/bleak → profile-driven GATT strategy → uinput gamepad.
+Reconnect loop, structured stage logging, diagnostic JSON summary, systemd-ready.
 
 Usage:
-  python3 switch2d.py --diagnose --verbose --json   # verify + JSON summary
-  python3 switch2d.py --daemon                       # run forever with reconnect
-  python3 switch2d.py --max-reports 0               # infinite reports (no limit)
+  python3 switch2d.py --diagnose --verbose          # auto-detect best profile
+  python3 switch2d.py --daemon --profile macos       # run forever with explicit profile
+  python3 switch2d.py --max-reports 0               # infinite reports
   python3 switch2d.py --address E0:EF:BF:3B:C6:76 --verbose
 
 Stage exit codes:
@@ -20,15 +21,15 @@ Stage exit codes:
   11 — Scan: no controller found
   12 — Connect: BLE connection failed
   13 — Discover: required GATT characteristics missing
-  14 — Init: ProCon2 init sequence failed (only with --init)
+  14 — Init: init sequence failed (joycon2cpp profile only)
   15 — Subscribe: notification subscription failed or zero reports
   16 — Running: disconnected unexpectedly
   0  — Diagnose: all stages passed, reports received
 
-⚠️ STATUS: Awaiting hardware validation. The daemon compiles and passes 107
-   unit tests but has NOT been tested with the actual Switch 2 Pro Controller
-   on a Raspberry Pi. Do not claim wireless working until a real hardware run
-   is documented.
+⚠️ STATUS: Awaiting hardware validation. The daemon compiles and passes unit
+   tests but has NOT been tested with the actual Switch 2 Pro Controller on a
+   Raspberry Pi. Do not claim wireless working until a real hardware run is
+   documented.
 """
 
 from __future__ import annotations
@@ -42,7 +43,6 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
@@ -55,31 +55,78 @@ except ImportError:
     print("FATAL: bleak not installed. Run: pip install bleak", file=sys.stderr)
     sys.exit(99)
 
-# ── Protocol Constants ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# PROTOCOL PROFILES
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class ProtocolProfile:
+    """Encapsulates one documented connection strategy."""
+    name: str                                    # "macos" | "spro2win" | "joycon2cpp"
+    source: str                                  # citation
+    input_uuids: List[str]                       # UUIDs to probe (first match wins)
+    command_uuid: Optional[str]                  # for init writes (None = no init)
+    init_commands: List[tuple[str, bytes, float]]  # (label, payload, delay_s)
+    subscribe_strategy: str                      # "selected" | "all"
+    spro2win_handle: Optional[int]              # handle filter for "all" strategy
+    description: str
+
+# ── Profile definitions ──
+
+PROFILE_MACOS = ProtocolProfile(
+    name="macos",
+    source="mlstr0m/switch2bridge-macos (macOS, WORKING)",
+    input_uuids=["7492866c-ec3e-4619-8258-32755ffcc0f9"],
+    command_uuid=None,
+    init_commands=[],
+    subscribe_strategy="selected",
+    spro2win_handle=None,
+    description="Selected notify on 7492866c. No init. Matches macOS CoreBluetooth path.",
+)
+
+PROFILE_SPRO2WIN = ProtocolProfile(
+    name="spro2win",
+    source="SquareDonut1/SPro2Win (Windows, WORKING)",
+    input_uuids=[],  # no fixed UUID — subscribe to ALL notifies
+    command_uuid=None,
+    init_commands=[],
+    subscribe_strategy="all",
+    spro2win_handle=45,
+    description="Subscribe-all notify, filter handle 45. No init. Matches Windows BLE path.",
+)
+
+PROFILE_JOYCON2CPP = ProtocolProfile(
+    name="joycon2cpp",
+    source="TheFrano/joycon2cpp (Windows, WORKING)",
+    input_uuids=["ab7de9be-89fe-49ad-828f-118f09df7fd2"],
+    command_uuid="649d4ac9-8eb7-4e6c-af44-1ea54fe5f005",
+    init_commands=[
+        ("feature-select 0x02", bytes.fromhex("0c 91 01 02 00 04 00 00 ff 00 00 00"), 0.5),
+        ("feature-select 0x04", bytes.fromhex("0c 91 01 04 00 04 00 00 ff 00 00 00"), 0.2),
+        ("set LED", bytes.fromhex("09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00"), 0.05),
+    ],
+    subscribe_strategy="selected",
+    spro2win_handle=None,
+    description="Init writes + selected notify on ab7de9be. Full ProCon2 init sequence.",
+)
+
+PROTOCOL_PROFILES: Dict[str, ProtocolProfile] = {
+    "macos": PROFILE_MACOS,
+    "spro2win": PROFILE_SPRO2WIN,
+    "joycon2cpp": PROFILE_JOYCON2CPP,
+}
+
+# Auto-detect order (for --profile auto)
+AUTO_PROFILE_ORDER = ["macos", "spro2win", "joycon2cpp"]
+
+# ═══════════════════════════════════════════════════════════════
+# PROTOCOL CONSTANTS
+# ═══════════════════════════════════════════════════════════════
 
 NINTENDO_MFR_ID        = 0x0553
 NINTENDO_VID           = 0x057E
 PRO_CONTROLLER2_PID    = 0x2069
 PRO_CONTROLLER2_PID_LE = b'\x69\x20'  # 0x2069 little-endian, for scan matching
-
-# Multiple input UUIDs from working implementations (probed in order)
-UUID_INPUT_REPORT_PRIMARY   = "7492866c-ec3e-4619-8258-32755ffcc0f9"  # macOS bridge (WORKING)
-UUID_INPUT_REPORT_SECONDARY = "ab7de9be-89fe-49ad-828f-118f09df7fd2"  # CareyScott/ndeadly research
-UUID_COMMAND_WRITE          = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
-UUID_COMMAND_RESPONSE       = "c765a961-d9d8-4d36-a20a-5315b111836a"
-UUID_SPRO2WIN_COMMAND       = "3dacbc7e-6955-40b5-8eaf-6f9809e8b379"  # SPro2Win command channel
-SPRO2WIN_INPUT_HANDLE       = 45  # SPro2Win fixed handle
-
-# Input UUID probe order (tried in sequence, first found wins)
-INPUT_UUID_CANDIDATES = [
-    UUID_INPUT_REPORT_PRIMARY,
-    UUID_INPUT_REPORT_SECONDARY,
-]
-
-# ProCon2 init commands — optional, NOT used by working implementations
-PROCON2_INIT_FEATURE_02 = bytes.fromhex("0c 91 01 02 00 04 00 00 ff 00 00 00")
-PROCON2_INIT_FEATURE_04 = bytes.fromhex("0c 91 01 04 00 04 00 00 ff 00 00 00")
-PROCON2_LED_CMD         = bytes.fromhex("09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00")
 
 # Button map: byte-level bitmasks from working implementations (SPro2Win + macOS bridge).
 # Byte 2 (right cluster): bits 0-7
@@ -216,13 +263,11 @@ def decode_report(data: bytes) -> Optional[Dict[str, Any]]:
     if len(data) < 11:
         return None
 
-    # Byte-level button decoding
     pressed = [
         name for name, (byte_idx, mask) in BUTTON_MAP.items()
         if len(data) > byte_idx and (data[byte_idx] & mask)
     ]
 
-    # Sticks at bytes 5-10 (12-bit packed, same across all implementations)
     left = decode_stick12(data, 5)
     right = decode_stick12(data, 8)
 
@@ -233,7 +278,6 @@ def decode_report(data: bytes) -> Optional[Dict[str, Any]]:
         "right_stick": right,
     }
 
-    # Accel/gyro only available in long (0x3C-byte) reports
     if len(data) >= 0x3C:
         result["accel"] = {"x": s16(data, 0x30), "y": s16(data, 0x32), "z": s16(data, 0x34)}
         result["gyro"] = {"x": s16(data, 0x36), "y": s16(data, 0x38), "z": s16(data, 0x3A)}
@@ -272,7 +316,10 @@ class DaemonState:
     device: Optional[BLEDevice] = None
     cmd_write_handle: Optional[int] = None
     input_report_handle: Optional[int] = None
-    input_report_uuid: Optional[str] = None  # which UUID was matched
+    input_report_uuid: Optional[str] = None
+
+    # Active profile — always set before any stage function runs
+    active_profile: ProtocolProfile = field(default_factory=lambda: PROFILE_MACOS)
 
     # Runtime stats
     report_count: int = 0
@@ -290,22 +337,21 @@ class DaemonState:
     report_lengths: List[int] = field(default_factory=list)
     report_timestamps: List[float] = field(default_factory=list)
 
-    # Stage result flags — survive cleanup_client(), used for diagnostic summary
+    # Stage result flags — survive cleanup_client()
     stage_scan_ok: bool = False
     stage_connect_ok: bool = False
     stage_discover_ok: bool = False
     stage_subscribe_ok: bool = False
     stage_reports_ok: bool = False
 
-    # SPro2Win mode tracking
-    spro2win_active: bool = False
-    spro2win_subscribe_count: int = 0
+    # Profile tracking (auto mode)
+    attempted_profiles: List[Dict[str, Any]] = field(default_factory=list)
+    winning_profile: Optional[str] = None
 
     # uinput
     uinput: Any = None
 
     async def sleep_breakable(self, delay: float) -> None:
-        """Sleep that checks shutdown flag periodically for fast exit."""
         steps = int(delay / 0.25)
         for _ in range(max(steps, 1)):
             if self.shutdown:
@@ -313,16 +359,15 @@ class DaemonState:
             await asyncio.sleep(0.25)
 
     def reset_session(self) -> None:
-        """Reset per-connection state for reconnect."""
         self.client = None
         self.report_count = 0
         self.cmd_write_handle = None
         self.input_report_handle = None
+        self.input_report_uuid = None
         self.disconnect_event.clear()
         self.notify_event.clear()
 
     def exit_code_for_stage(self, stage: str) -> int:
-        """Map stage name to exit code."""
         codes = {
             "preflight": 10, "scan": 11, "connect": 12,
             "discover": 13, "init": 14, "subscribe": 15, "running": 16,
@@ -333,18 +378,13 @@ class DaemonState:
 # ── Stage: Preflight ───────────────────────────────────────────
 
 async def stage_preflight(state: DaemonState) -> bool:
-    """Check dependencies and permissions."""
     state.log.stage("preflight", "start")
-
-    # Check bleak
     try:
         import bleak
         state.log.info(f"bleak {bleak.__version__}")
     except Exception:
         state.log.error("bleak not available")
         return False
-
-    # Check evdev if uinput requested
     if state.args.uinput:
         try:
             import evdev
@@ -352,19 +392,14 @@ async def stage_preflight(state: DaemonState) -> bool:
         except ImportError:
             state.log.error("python-evdev not installed; run: pip install evdev")
             return False
-
         if not os.path.exists("/dev/uinput"):
             state.log.warn("/dev/uinput not found; modprobe uinput?")
-            # Non-fatal — uinput will fail later gracefully
-
-    # Try to access Bluetooth adapter
     try:
-        devices = await BleakScanner.discover(timeout=2.0, return_adv=False)
+        await BleakScanner.discover(timeout=2.0, return_adv=False)
         state.log.info("Bluetooth adapter accessible")
     except Exception as e:
         state.log.error(f"Bluetooth adapter not accessible: {e}")
         return False
-
     state.log.stage("preflight", "ok")
     return True
 
@@ -372,10 +407,8 @@ async def stage_preflight(state: DaemonState) -> bool:
 # ── Stage: Scan ────────────────────────────────────────────────
 
 async def stage_scan(state: DaemonState) -> bool:
-    """BLE scan for Nintendo Switch 2 Pro Controller (PID 0x2069 by default)."""
     strict_pid = not state.args.loose_scan
-    state.log.stage("scan", "start", timeout=state.args.scan_timeout,
-                    strict_pid=strict_pid)
+    state.log.stage("scan", "start", timeout=state.args.scan_timeout, strict_pid=strict_pid)
 
     address_filter = state.args.address
     found_device: Optional[BLEDevice] = None
@@ -384,41 +417,28 @@ async def stage_scan(state: DaemonState) -> bool:
 
     def callback(device: BLEDevice, adv: AdvertisementData):
         nonlocal found_device, found_info
-
         if address_filter and device.address.upper() != address_filter.upper():
             return
-
-        # Match both manufacturer IDs: 0x0553 (Cypress chip) and 0x057E (Nintendo BT SIG)
         mfg_data = adv.manufacturer_data.get(NINTENDO_MFR_ID)
         nintendo_vid_data = adv.manufacturer_data.get(NINTENDO_VID)
-
         if not mfg_data and not nintendo_vid_data:
             return
-
-        # macOS bridge approach: check for PID bytes in manufacturer data
         if nintendo_vid_data and PRO_CONTROLLER2_PID_LE not in nintendo_vid_data:
-            if not mfg_data:  # Nintendo VID but wrong PID → skip
+            if not mfg_data:
                 return
-
         info = parse_manufacturer_data(mfg_data if mfg_data else nintendo_vid_data)
-        vid = info.get("vendor_id")
         pid = info.get("product_id")
-
-        # Strict mode: only accept exactly Pro Controller 2 (PID 0x2069)
-        # pid=None (unparseable mfg data) is also rejected unless --loose-scan
         if strict_pid and pid != PRO_CONTROLLER2_PID:
             if state.args.verbose:
                 state.log.info(f"  skip {device.address} pid=0x{pid:04x} (not Pro Controller 2)")
             return
-
         if not found_device:
             found_device = device
             found_info = info
             found_event.set()
-
         state.log.info(
             f"found {device.address} rssi={adv.rssi} "
-            f"vid=0x{vid:04x} pid=0x{pid:04x} "
+            f"vid=0x{info.get('vendor_id', 0):04x} pid=0x{pid:04x} "
             f"reconnect_mac={info.get('reconnect_mac', b'').hex(':') if info.get('reconnect_mac') else '?'}"
         )
 
@@ -443,7 +463,6 @@ async def stage_scan(state: DaemonState) -> bool:
 # ── Stage: Connect ─────────────────────────────────────────────
 
 async def stage_connect(state: DaemonState) -> bool:
-    """Establish BLE connection to the discovered device."""
     state.log.stage("connect", "start", address=state.device.address)
 
     def on_disconnect(client: BleakClient):  # noqa: ARG001
@@ -457,13 +476,11 @@ async def stage_connect(state: DaemonState) -> bool:
             delay = min(1.0 * attempt, 5.0)
             state.log.info(f"connect retry {attempt}/{state.args.connect_retries} in {delay:.1f}s")
             await asyncio.sleep(delay)
-
         try:
             await asyncio.wait_for(client.connect(), timeout=20.0)
             state.client = client
             state.stage_connect_ok = True
-            state.log.stage("connect", "ok", mtu=client.mtu_size,
-                           address=state.device.address)
+            state.log.stage("connect", "ok", mtu=client.mtu_size, address=state.device.address)
             return True
         except asyncio.TimeoutError:
             state.log.warn(f"connect timeout (attempt {attempt})")
@@ -477,20 +494,19 @@ async def stage_connect(state: DaemonState) -> bool:
 # ── Stage: Discover ────────────────────────────────────────────
 
 async def stage_discover(state: DaemonState) -> bool:
-    """GATT service + characteristic discovery."""
-    state.log.stage("discover", "start")
+    """GATT service + characteristic discovery, profile-driven."""
+    profile = state.active_profile
+    state.log.stage("discover", "start", profile=profile.name)
 
     services = None
     max_attempts = state.args.gatt_retries
     for attempt in range(1, max_attempts + 1):
         try:
-            # Primary: direct .services access (fast, works on most backends)
             services = state.client.services
             if services:
                 break
         except Exception as e:
             state.log.warn(f"GATT .services failed ({attempt}/{max_attempts}): {e}")
-        # Fallback: explicit get_services() call (works on some backends where .services doesn't)
         try:
             services = await state.client.get_services()
             if services:
@@ -507,9 +523,11 @@ async def stage_discover(state: DaemonState) -> bool:
 
     state.cmd_write_handle = None
     state.input_report_handle = None
-    state.input_report_uuid = None  # which UUID we matched
+    state.input_report_uuid = None
     service_count = 0
     char_count = 0
+
+    input_candidates = [] if profile.subscribe_strategy == "all" else profile.input_uuids
 
     for svc in services:
         service_count += 1
@@ -521,29 +539,29 @@ async def stage_discover(state: DaemonState) -> bool:
             if state.args.verbose:
                 state.log.info(f"  char {uuid_str[:36]} [{props}] handle={char.handle}")
 
-            # Probe input UUIDs in priority order (first match wins)
-            if not state.input_report_handle:
-                for candidate_uuid in INPUT_UUID_CANDIDATES:
+            # Match input UUIDs (only for "selected" strategy)
+            if profile.subscribe_strategy == "selected" and not state.input_report_handle:
+                for candidate_uuid in input_candidates:
                     if uuid_str == candidate_uuid.lower():
                         state.input_report_handle = char.handle
                         state.input_report_uuid = candidate_uuid
                         state.log.info(f"  → input report: handle={char.handle} uuid={candidate_uuid[:36]} props={props}")
                         break
 
-            if uuid_str == UUID_COMMAND_WRITE.lower():
+            # Match command UUID (only if profile requires init)
+            if profile.command_uuid and uuid_str == profile.command_uuid.lower():
                 state.cmd_write_handle = char.handle
                 state.log.info(f"  → command write: handle={char.handle} props={props}")
 
-    if not state.input_report_handle:
+    if profile.subscribe_strategy == "selected" and not state.input_report_handle:
         state.log.stage("discover", "fail",
-                        reason=f"no input report UUID found (tried: {INPUT_UUID_CANDIDATES})",
+                        reason=f"no input UUID found (profile={profile.name}, tried={input_candidates})",
                         services=service_count, chars=char_count)
         return False
 
-    # Command write only needed if --init flag is set
-    if state.args.init and not state.cmd_write_handle:
+    if profile.command_uuid and not state.cmd_write_handle:
         state.log.stage("discover", "fail",
-                        reason=f"command write UUID {UUID_COMMAND_WRITE} not found (needed for --init)",
+                        reason=f"command write UUID {profile.command_uuid} not found",
                         services=service_count, chars=char_count)
         return False
 
@@ -558,29 +576,17 @@ async def stage_discover(state: DaemonState) -> bool:
 # ── Stage: Init ────────────────────────────────────────────────
 
 async def stage_init(state: DaemonState) -> bool:
-    """Send ProCon2 init sequence — only if --init flag is set."""
-    if not state.args.init:
-        state.log.stage("init", "ok", skipped="init off by default (working impls skip it)")
+    """Send profile-specific init commands."""
+    profile = state.active_profile
+    if not profile.init_commands:
+        state.log.stage("init", "ok", skipped=f"profile={profile.name} has no init")
         return True
 
-    if state.args.mode == "none":
-        state.log.stage("init", "ok", skipped="mode=none")
-        return True
-
-    state.log.stage("init", "start", mode=state.args.mode)
-
-    commands = [
-        ("feature-select 0x02", PROCON2_INIT_FEATURE_02, 0.5),
-        ("feature-select 0x04", PROCON2_INIT_FEATURE_04, 0.2),
-    ]
-    if not state.args.no_led:
-        commands.append(("set LED", PROCON2_LED_CMD, 0.05))
-
-    for label, payload, delay_s in commands:
+    state.log.stage("init", "start", profile=profile.name)
+    for label, payload, delay_s in profile.init_commands:
         state.log.info(f"  → {label}: {payload.hex(' ')}")
         try:
-            await state.client.write_gatt_char(
-                UUID_COMMAND_WRITE, payload, response=False)
+            await state.client.write_gatt_char(profile.command_uuid, payload, response=False)
             state.log.info(f"  ← {label}: OK")
         except Exception as e:
             state.log.error(f"  ← {label}: FAILED: {e}")
@@ -595,25 +601,27 @@ async def stage_init(state: DaemonState) -> bool:
 # ── Stage: Subscribe ───────────────────────────────────────────
 
 async def stage_subscribe(state: DaemonState) -> bool:
-    """Subscribe to input report notifications."""
-    state.log.stage("subscribe", "start")
-    matched_uuid = state.input_report_uuid or UUID_INPUT_REPORT_PRIMARY
+    """Subscribe to input reports — profile-driven strategy."""
+    profile = state.active_profile
+    state.log.stage("subscribe", "start", profile=profile.name, strategy=profile.subscribe_strategy)
 
-    def report_handler(sender, data: bytearray):
-        handle_report(state, bytes(data), getattr(sender, "handle", None))
+    handler = _make_report_handler(state)
 
-    # SPro2Win mode: subscribe to ALL notify chars, filter by handle
-    if state.args.spro2win:
-        return await _subscribe_all_notify(state, report_handler)
+    if profile.subscribe_strategy == "all":
+        return await _subscribe_all_notify(state, handler)
+
+    # "selected" strategy: subscribe to matched UUID
+    matched_uuid = state.input_report_uuid
+    if not matched_uuid:
+        state.log.stage("subscribe", "fail", reason="no input UUID matched during discover")
+        return False
 
     max_attempts = state.args.gatt_retries
     for attempt in range(1, max_attempts + 1):
         try:
-            await state.client.start_notify(matched_uuid, report_handler)
+            await state.client.start_notify(matched_uuid, handler)
             state.stage_subscribe_ok = True
-            state.log.stage("subscribe", "ok",
-                           handle=state.input_report_handle,
-                           uuid=matched_uuid)
+            state.log.stage("subscribe", "ok", handle=state.input_report_handle, uuid=matched_uuid)
             return True
         except Exception as e:
             state.log.warn(f"subscribe failed ({attempt}/{max_attempts}): {e}")
@@ -625,7 +633,8 @@ async def stage_subscribe(state: DaemonState) -> bool:
 
 
 async def _subscribe_all_notify(state: DaemonState, handler) -> bool:
-    """SPro2Win-style: subscribe to every notify characteristic, filter by handle."""
+    """Subscribe to every notify characteristic, filter by profile handle."""
+    profile = state.active_profile
     state.log.info("subscribe-all mode: subscribing to all notify characteristics")
     count = 0
     for svc in state.client.services:
@@ -636,43 +645,43 @@ async def _subscribe_all_notify(state: DaemonState, handler) -> bool:
                 await state.client.start_notify(char, handler)
                 count += 1
                 state.log.info(f"  subscribed: {char.uuid} handle={char.handle}")
+                # Record first notify-capable handle as input source
+                if state.input_report_handle is None:
+                    state.input_report_handle = char.handle
             except Exception as e:
                 state.log.warn(f"  subscribe failed handle={char.handle}: {e}")
     if count == 0:
         state.log.stage("subscribe", "fail", reason="no notify characteristics found")
         return False
-    state.spro2win_active = True
-    state.spro2win_subscribe_count = count
     state.stage_subscribe_ok = True
     state.log.stage("subscribe", "ok", mode="subscribe-all", count=count)
-    return True
+    return count > 0
 
 
 # ── Report Handling ────────────────────────────────────────────
 
 def handle_report(state: DaemonState, data: bytes, handle: Optional[int] = None) -> None:
     """Process an incoming input report."""
-    # SPro2Win mode: filter by fixed handle 45
-    if state.args.spro2win and handle is not None and handle != SPRO2WIN_INPUT_HANDLE:
-        return
+    # SPro2Win-style handle filter
+    profile = state.active_profile
+    if profile and profile.spro2win_handle is not None:
+        if handle is not None and handle != profile.spro2win_handle:
+            return
 
     state.report_count += 1
     state.total_reports += 1
     state.notify_event.set()
     state.stage_reports_ok = True
 
-    # Telemetry
     now = time.monotonic()
     state.report_lengths.append(len(data))
     state.report_timestamps.append(now)
 
-    # Track first/last report for diagnostic summary
     hex_str = data.hex()
     if state.first_report_hex is None:
         state.first_report_hex = hex_str
     state.last_report_hex = hex_str
 
-    # JSONL dump
     if state.jsonl_file:
         record = {
             "ts": round(time.monotonic() - state.start_time, 3),
@@ -686,15 +695,12 @@ def handle_report(state: DaemonState, data: bytes, handle: Optional[int] = None)
 
     decoded = decode_report(data)
     if decoded:
-        # Log
         sticks = {}
         if decoded.get("left_stick"):
             sticks["left"] = decoded["left_stick"]
         if decoded.get("right_stick"):
             sticks["right"] = decoded["right_stick"]
         state.log.report(state.report_count, len(data), decoded.get("pressed", []), sticks)
-
-        # Update uinput
         if state.uinput:
             update_uinput(state, decoded)
 
@@ -703,7 +709,6 @@ def update_uinput(state: DaemonState, decoded: Dict[str, Any]) -> None:
     """Map decoded ProCon2 report to Linux uinput events."""
     try:
         from evdev import ecodes as e
-
         pressed = set(decoded.get("pressed", []))
         btn_map = {
             "b": e.BTN_SOUTH, "a": e.BTN_EAST, "y": e.BTN_NORTH, "x": e.BTN_WEST,
@@ -738,10 +743,8 @@ def update_uinput(state: DaemonState, decoded: Dict[str, Any]) -> None:
 # ── Uinput Setup ───────────────────────────────────────────────
 
 def setup_uinput(state: DaemonState) -> bool:
-    """Create a Linux uinput gamepad device."""
     try:
         from evdev import UInput, AbsInfo, ecodes as e
-
         buttons = [
             e.BTN_SOUTH, e.BTN_EAST, e.BTN_NORTH, e.BTN_WEST,
             e.BTN_TL, e.BTN_TR, e.BTN_TL2, e.BTN_TR2,
@@ -751,20 +754,14 @@ def setup_uinput(state: DaemonState) -> bool:
         ]
         abs_axis = AbsInfo(value=0, min=-32768, max=32767, fuzz=16, flat=128, resolution=0)
         trigger_axis = AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)
-
         state.uinput = UInput(
-            {
-                e.EV_KEY: buttons,
-                e.EV_ABS: [
-                    (e.ABS_X, abs_axis), (e.ABS_Y, abs_axis),
-                    (e.ABS_RX, abs_axis), (e.ABS_RY, abs_axis),
-                    (e.ABS_Z, trigger_axis), (e.ABS_RZ, trigger_axis),
-                ],
-            },
+            {e.EV_KEY: buttons, e.EV_ABS: [
+                (e.ABS_X, abs_axis), (e.ABS_Y, abs_axis),
+                (e.ABS_RX, abs_axis), (e.ABS_RY, abs_axis),
+                (e.ABS_Z, trigger_axis), (e.ABS_RZ, trigger_axis),
+            ]},
             name="Nintendo Switch 2 Pro Controller",
-            vendor=NINTENDO_VID,
-            product=PRO_CONTROLLER2_PID,
-            version=1,
+            vendor=NINTENDO_VID, product=PRO_CONTROLLER2_PID, version=1,
         )
         state.log.stage("uinput", "ok", name="Nintendo Switch 2 Pro Controller")
         return True
@@ -773,14 +770,19 @@ def setup_uinput(state: DaemonState) -> bool:
         return False
 
 
-# ── Connection Session ─────────────────────────────────────────
+# ── Session (profile-driven) ───────────────────────────────────
 
-async def run_session(state: DaemonState) -> bool:
-    """Run a single full connection session. Returns True on clean shutdown."""
+async def run_session(state: DaemonState, profile: Optional[ProtocolProfile] = None) -> bool:
+    """Run a single connection session with the given profile."""
+    if profile:
+        state.active_profile = profile
+    else:
+        # No profile set yet — use macos as fallback
+        state.active_profile = PROFILE_MACOS
+
     state.reset_session()
-    state.log.stage("session", "start", attempt=state.reconnect_count + 1)
+    state.log.stage("session", "start", profile=state.active_profile.name, attempt=state.reconnect_count + 1)
 
-    # Stage pipeline
     stages = [
         ("scan", stage_scan),
         ("connect", stage_connect),
@@ -796,39 +798,29 @@ async def run_session(state: DaemonState) -> bool:
             await cleanup_client(state)
             return False
 
-    # Running: wait for reports or disconnect
     state.log.stage("running", "start", max_reports=state.args.max_reports)
-
     timeout = state.args.notify_timeout
     try:
         while not state.shutdown:
             state.notify_event.clear()
-
             try:
                 await asyncio.wait_for(state.notify_event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 state.log.warn(f"no reports for {timeout}s")
                 break
-
             if state.args.max_reports > 0 and state.report_count >= state.args.max_reports:
-                state.log.stage("running", "ok",
-                               reports=state.report_count,
-                               reason="max_reports reached")
+                state.log.stage("running", "ok", reports=state.report_count, reason="max_reports reached")
                 break
-
-            timeout = state.args.notify_timeout  # reset after each report
-
+            timeout = state.args.notify_timeout
     except Exception as e:
         state.log.error(f"running error: {e}")
 
     state.log.stage("session", "ok", reports=state.report_count)
     await cleanup_client(state)
-    # Zero reports after successful subscribe = failure
     return state.report_count > 0
 
 
 async def cleanup_client(state: DaemonState) -> None:
-    """Disconnect and clean up client state."""
     if state.client and state.client.is_connected:
         try:
             await state.client.disconnect()
@@ -840,25 +832,19 @@ async def cleanup_client(state: DaemonState) -> None:
 # ── Reconnect Loop ─────────────────────────────────────────────
 
 async def reconnect_loop(state: DaemonState) -> int:
-    """Infinite reconnect loop for daemon mode. Returns only on shutdown."""
     state.log.info("daemon mode: reconnect loop active")
-
     while not state.shutdown:
         session_ok = await run_session(state)
-
         if state.shutdown:
             break
-
         if session_ok:
-            # Clean session end — wait for disconnect event before retrying
-            state.reconnect_count = 0  # reset backoff on clean sessions
+            state.reconnect_count = 0
             state.log.info("session ended; waiting for controller...")
             try:
                 await asyncio.wait_for(state.disconnect_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 pass
         else:
-            # Failed session — exponential backoff
             state.reconnect_count += 1
             delay = min(
                 RECONNECT_BASE_DELAY * (RECONNECT_BACKOFF ** (state.reconnect_count - 1)),
@@ -869,58 +855,77 @@ async def reconnect_loop(state: DaemonState) -> int:
                 await asyncio.wait_for(state.sleep_breakable(delay), timeout=delay + 1)
             except asyncio.TimeoutError:
                 pass
-
     return 0
 
 
-# ── Diagnose Mode ──────────────────────────────────────────────
+# ── Auto-Detect Mode ───────────────────────────────────────────
 
-async def diagnose_mode(state: DaemonState) -> int:
-    """Run one full session with auto-notify-fallback, print JSON diagnostic summary."""
-    state.log.stage("diagnose", "start")
+async def _try_profile(state: DaemonState, profile: ProtocolProfile) -> Dict[str, Any]:
+    """Try one profile: connect, run session, record result."""
+    result: Dict[str, Any] = {
+        "profile": profile.name,
+        "source": profile.source,
+        "success": False,
+        "failure_reason": None,
+        "report_count": 0,
+        "first_report_hex": None,
+    }
+    state.log.stage("auto", "start", profile=profile.name)
 
-    session_ok = await run_session(state)
+    session_ok = await run_session(state, profile)
+    result["report_count"] = state.report_count
+    result["first_report_hex"] = state.first_report_hex
 
-    # ── Auto-notify-fallback ──────────────────────────────────
-    # If we subscribed but got zero reports, try fallback UUIDs and subscribe-all
-    if (state.stage_subscribe_ok and not state.stage_reports_ok
-            and not state.args.spro2win and state.client and state.client.is_connected):
-        state.log.warn("auto-notify-fallback: subscribed OK but zero reports — trying fallbacks")
+    if session_ok and state.report_count > 0:
+        result["success"] = True
+        state.winning_profile = profile.name
+        state.log.stage("auto", "ok", profile=profile.name, reports=state.report_count)
+    elif session_ok:
+        result["failure_reason"] = "subscribed but zero reports"
+        state.log.stage("auto", "fail", profile=profile.name, reason=result["failure_reason"])
+    elif state.stage_subscribe_ok:
+        result["failure_reason"] = "subscribed but zero reports"
+        state.log.stage("auto", "fail", profile=profile.name, reason=result["failure_reason"])
+    elif state.stage_connect_ok:
+        result["failure_reason"] = "subscribe failed"
+        state.log.stage("auto", "fail", profile=profile.name, reason=result["failure_reason"])
+    elif state.stage_scan_ok:
+        result["failure_reason"] = "connect failed"
+        state.log.stage("auto", "fail", profile=profile.name, reason=result["failure_reason"])
+    else:
+        result["failure_reason"] = "scan failed"
+        state.log.stage("auto", "fail", profile=profile.name, reason=result["failure_reason"])
 
-        # Try each remaining UUID candidate
-        for fallback_uuid in INPUT_UUID_CANDIDATES:
-            if fallback_uuid == state.input_report_uuid:
-                continue
-            state.log.info(f"auto-notify-fallback: trying UUID {fallback_uuid[:36]}")
-            try:
-                await state.client.start_notify(fallback_uuid, _make_report_handler(state))
-                state.input_report_uuid = fallback_uuid
-                state.log.info(f"fallback subscribe to {fallback_uuid[:36]} OK")
-            except Exception as e:
-                state.log.warn(f"fallback subscribe failed: {e}")
-                continue
+    return result
 
-            # Wait for reports
-            try:
-                await asyncio.wait_for(state.notify_event.wait(), timeout=state.args.notify_timeout)
-                if state.stage_reports_ok:
-                    state.log.info("auto-notify-fallback: reports received!")
-                    session_ok = True
-                    break
-            except asyncio.TimeoutError:
-                state.log.warn(f"fallback UUID {fallback_uuid[:36]}: still no reports")
 
-        # Last resort: subscribe-all
-        if not state.stage_reports_ok:
-            state.log.info("auto-notify-fallback: trying subscribe-all (SPro2Win-style)")
-            if await _subscribe_all_notify(state, _make_report_handler(state)):
-                try:
-                    await asyncio.wait_for(state.notify_event.wait(), timeout=state.args.notify_timeout)
-                except asyncio.TimeoutError:
-                    state.log.warn("subscribe-all: still no reports")
+async def auto_detect_mode(state: DaemonState) -> int:
+    """Try profiles in order: macos → spro2win → joycon2cpp."""
+    state.log.stage("diagnose", "start", mode="auto")
 
-    # ── Compute telemetry ────────────────────────────────────
-    intervals: List[float] = []
+    for profile_name in AUTO_PROFILE_ORDER:
+        if state.shutdown:
+            break
+        profile = PROTOCOL_PROFILES[profile_name]
+
+        # Collect telemetry from this attempt
+        state.report_lengths.clear()
+        state.report_timestamps.clear()
+        state.first_report_hex = None
+
+        result = await _try_profile(state, profile)
+        state.attempted_profiles.append(result)
+
+        if result["success"]:
+            break
+
+        # Need to re-scan/re-connect for next profile attempt
+        if profile_name != AUTO_PROFILE_ORDER[-1]:
+            state.log.info(f"auto: trying next profile...")
+            state.reset_session()
+
+    # ── Diagnostic summary ──
+    intervals = []
     for i in range(1, len(state.report_timestamps)):
         intervals.append((state.report_timestamps[i] - state.report_timestamps[i-1]) * 1000.0)
 
@@ -934,7 +939,55 @@ async def diagnose_mode(state: DaemonState) -> int:
         telemetry["interval_max_ms"] = round(max(intervals), 1)
         telemetry["interval_avg_ms"] = round(sum(intervals) / len(intervals), 1)
 
-    # ── Build diagnostic summary ─────────────────────────────
+    winner = state.winning_profile
+    summary: Dict[str, Any] = {
+        "exit_code": 0 if winner else 16,
+        "mode": "auto",
+        "attempted_profiles": state.attempted_profiles,
+        "winning_profile": winner,
+        "report_count": state.report_count if winner else 0,
+        "first_report_hex": state.first_report_hex,
+        "telemetry": telemetry,
+    }
+
+    if state.uinput is not None:
+        summary["uinput"] = True
+
+    print(json.dumps(summary, indent=2), flush=True)
+
+    if winner:
+        state.log.info(f"AUTO-DIAGNOSE PASSED: winning profile={winner}, reports={state.report_count}")
+        return 0
+    else:
+        state.log.error("AUTO-DIAGNOSE FAILED: no profile succeeded")
+        return 16
+
+
+# ── Diagnose Mode ──────────────────────────────────────────────
+
+async def diagnose_mode(state: DaemonState) -> int:
+    """Run one session with explicit profile, print diagnostic JSON summary."""
+    if state.args.profile == "auto":
+        return await auto_detect_mode(state)
+
+    state.log.stage("diagnose", "start", profile=state.args.profile)
+    profile = PROTOCOL_PROFILES[state.args.profile]
+    session_ok = await run_session(state, profile)
+
+    intervals = []
+    for i in range(1, len(state.report_timestamps)):
+        intervals.append((state.report_timestamps[i] - state.report_timestamps[i-1]) * 1000.0)
+
+    telemetry: Dict[str, Any] = {}
+    if state.report_lengths:
+        telemetry["length_min"] = min(state.report_lengths)
+        telemetry["length_max"] = max(state.report_lengths)
+        telemetry["length_avg"] = round(sum(state.report_lengths) / len(state.report_lengths), 1)
+    if intervals:
+        telemetry["interval_min_ms"] = round(min(intervals), 1)
+        telemetry["interval_max_ms"] = round(max(intervals), 1)
+        telemetry["interval_avg_ms"] = round(sum(intervals) / len(intervals), 1)
+
     stages = {
         "scan": state.stage_scan_ok,
         "connect": state.stage_connect_ok,
@@ -945,6 +998,7 @@ async def diagnose_mode(state: DaemonState) -> int:
     }
     summary: Dict[str, Any] = {
         "exit_code": 0 if (session_ok and state.report_count > 0) else (15 if session_ok else 16),
+        "profile": profile.name,
         "stages": stages,
         "device": state.device.address if state.device else None,
         "input_uuid": state.input_report_uuid,
@@ -954,13 +1008,7 @@ async def diagnose_mode(state: DaemonState) -> int:
         "last_report_hex": state.last_report_hex,
         "telemetry": telemetry,
     }
-    if state.spro2win_active:
-        summary["spro2win"] = {
-            "active": True,
-            "subscribe_count": state.spro2win_subscribe_count,
-        }
 
-    # Always print JSON summary on stdout as final output
     print(json.dumps(summary, indent=2), flush=True)
 
     if session_ok and state.report_count > 0:
@@ -975,7 +1023,6 @@ async def diagnose_mode(state: DaemonState) -> int:
 
 
 def _make_report_handler(state: DaemonState):
-    """Create a report handler closure — used by auto-notify-fallback."""
     def handler(sender, data: bytearray):
         handle_report(state, bytes(data), getattr(sender, "handle", None))
     return handler
@@ -984,66 +1031,65 @@ def _make_report_handler(state: DaemonState):
 # ── Signal Handling ────────────────────────────────────────────
 
 def setup_signal_handlers(state: DaemonState, loop: asyncio.AbstractEventLoop) -> None:
-    """Register signal handlers for graceful shutdown."""
     def handler():
         state.log.info("shutdown signal received")
         state.shutdown = True
-
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, handler)
         except NotImplementedError:
-            pass  # Windows
+            pass
 
 
 # ── CLI ────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="switch2d — Switch 2 Pro Controller BLE daemon (BlueZ/bleak/uinput)",
+        description="switch2d — Switch 2 Pro Controller BLE daemon (BlueZ/bleak/uinput) v5.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
-  --diagnose     Run full connect→discover→init→subscribe cycle, report results, exit.
+  --diagnose     Auto-detect best profile, verify, print JSON summary, exit.
   --daemon       Run forever with automatic reconnect on disconnect.
-  (default)      Run one session and exit (like diagnose, but no summary).
+  (default)      Run one session and exit.
+
+Profiles:
+  auto           Try macos → spro2win → joycon2cpp sequentially.
+  macos          Selected notify on UUID 7492866c (switch2bridge-macos).
+  spro2win       Subscribe-all notify, filter handle 45 (SPro2Win).
+  joycon2cpp     Init writes + selected notify on ab7de9be (joycon2cpp).
 
 Examples:
-  %(prog)s --diagnose --verbose
-  %(prog)s --daemon --uinput --max-reports 0
-  %(prog)s --address E0:EF:BF:3B:C6:76 --mode none --verbose
+  %(prog)s --diagnose --verbose                     # auto-detect
+  %(prog)s --diagnose --profile spro2win --verbose  # explicit profile
+  %(prog)s --daemon --profile macos --uinput --max-reports 0
+  %(prog)s --address E0:EF:BF:3B:C6:76 --verbose
 """,
     )
 
     # Mode
     p.add_argument("--diagnose", action="store_true", default=False,
-                   help="Diagnostic mode: verify everything works, then exit")
+                   help="Diagnostic mode: verify everything, print JSON summary, exit")
     p.add_argument("--daemon", action="store_true", default=False,
                    help="Daemon mode: run forever with reconnect loop")
 
+    # Profile
+    p.add_argument("--profile", type=str, default="auto",
+                   choices=("auto", "macos", "spro2win", "joycon2cpp"),
+                   help="Protocol profile. auto=sequential fallback, macos/spro2win/joycon2cpp=explicit. "
+                        "Default: auto for --diagnose, macos for --daemon.")
+
     # Scan
-    p.add_argument("--scan-timeout", type=float, default=10.0,
-                   help="BLE scan duration in seconds (default: 10)")
-    p.add_argument("--address", type=str, default=None,
-                   help="Filter scan to specific BDADDR")
+    p.add_argument("--scan-timeout", type=float, default=10.0)
+    p.add_argument("--address", type=str, default=None)
     p.add_argument("--loose-scan", action="store_true", default=False,
                    help="Accept any Nintendo device (default: PID 0x2069 only)")
 
     # Connect
-    p.add_argument("--connect-retries", type=int, default=3,
-                   help="BLE connection retries (default: 3)")
+    p.add_argument("--connect-retries", type=int, default=3)
 
     # GATT
-    p.add_argument("--gatt-retries", type=int, default=10,
-                   help="GATT service discovery retries (default: 10)")
-    p.add_argument("--mode", choices=("procon2", "none"), default="none",
-                   help="Init mode: procon2=joycon2cpp init, none=skip (default: none)")
-    p.add_argument("--init", action="store_true", default=False,
-                   help="Send ProCon2 init sequence (off by default — working impls skip it)")
-    p.add_argument("--spro2win", action="store_true", default=False,
-                   help="SPro2Win mode: subscribe-all-notify, handle 45 filter, no init")
-    p.add_argument("--no-led", action="store_true", default=False,
-                   help="Skip LED command in procon2 init")
+    p.add_argument("--gatt-retries", type=int, default=10)
     p.add_argument("--notify-timeout", type=float, default=30.0,
                    help="Max seconds without reports before disconnect (default: 30)")
 
@@ -1051,15 +1097,14 @@ Examples:
     p.add_argument("--max-reports", type=int, default=100,
                    help="Max reports before exit (0=unlimited, default: 100)")
     p.add_argument("--dump-jsonl", type=str, default=None,
-                   help="Save all received reports to JSONL file (for hardware golden runs)")
+                   help="Save all received reports to JSONL file")
 
     # uinput
     p.add_argument("--uinput", action="store_true", default=False,
                    help="Create Linux uinput gamepad device")
 
     # Logging
-    p.add_argument("--verbose", action="store_true", default=False,
-                   help="Verbose output")
+    p.add_argument("--verbose", action="store_true", default=False)
     p.add_argument("--json", action="store_true", default=False,
                    help="JSON-line structured log output")
     p.add_argument("--quiet", action="store_true", default=False,
@@ -1073,7 +1118,6 @@ Examples:
 async def async_main() -> int:
     args = parse_args()
 
-    # Logging setup
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
     elif args.quiet:
@@ -1083,20 +1127,21 @@ async def async_main() -> int:
     state = DaemonState(args=args, log=log)
     state.start_time = time.monotonic()
 
-    # Signal handlers
+    # Resolve profile
+    if args.daemon and args.profile == "auto":
+        args.profile = "macos"  # daemon default
+        state.log.info("--daemon with profile=auto → defaulting to macos")
+
     loop = asyncio.get_running_loop()
     setup_signal_handlers(state, loop)
 
-    # Preflight
     if not await stage_preflight(state):
         return 10
 
-    # Setup uinput if requested
     if args.uinput and not setup_uinput(state):
         if args.diagnose:
             return 10
 
-    # Open JSONL file if requested
     if args.dump_jsonl:
         jsonl_path = Path(args.dump_jsonl)
         state.jsonl_file = jsonl_path.open("w")
@@ -1108,8 +1153,8 @@ async def async_main() -> int:
         elif args.daemon:
             return await reconnect_loop(state)
         else:
-            # Default: single session
-            session_ok = await run_session(state)
+            profile = PROTOCOL_PROFILES.get(args.profile, PROFILE_MACOS)
+            session_ok = await run_session(state, profile)
             return 0 if (session_ok and state.report_count > 0) else 16
     except KeyboardInterrupt:
         log.info("interrupted")
@@ -1121,13 +1166,11 @@ async def async_main() -> int:
             traceback.print_exc()
         return 99
     finally:
-        # Cleanup uinput
         if state.uinput:
             try:
                 state.uinput.close()
             except Exception:
                 pass
-        # Close JSONL file
         if state.jsonl_file:
             try:
                 state.jsonl_file.close()
