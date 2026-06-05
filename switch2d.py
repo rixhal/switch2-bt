@@ -112,13 +112,29 @@ PROFILE_JOYCON2CPP = ProtocolProfile(
     description="Init writes + LED + Sound + selected notify on ab7de9be. Full joycon2cpp init sequence.",
 )
 
+# ── Experimental: joycon2cpp-pair (Nintendo COMMAND_PAIR 0x15 before init) ──
+# ⚠️ EXPERIMENTAL — not in auto-detect order. Uses donor controller LTK values
+# from CareyScott/Nadeflore reverse engineering. May not work without a real
+# paired controller session. See SMP_RESEARCH.md for full context.
+PROFILE_JOYCON2CPP_PAIR = ProtocolProfile(
+    name="joycon2cpp-pair",
+    source="CareyScott/switch2controllerpc + Nadeflore/switch2-controllers (PAIR) + TheFrano/joycon2cpp (init)",
+    input_uuids=["ab7de9be-89fe-49ad-828f-118f09df7fd2"],
+    command_uuid="649d4ac9-8eb7-4e6c-af44-1ea54fe5f005",
+    init_commands=PROFILE_JOYCON2CPP.init_commands.copy(),  # Same init after pair
+    subscribe_strategy="selected",
+    spro2win_handle=None,
+    description="EXPERIMENTAL: COMMAND_PAIR 0x15 (SetMAC→LTK1→LTK2→Finish) + joycon2cpp init + selected notify. Donor keys required.",
+)
+
 PROTOCOL_PROFILES: Dict[str, ProtocolProfile] = {
     "macos": PROFILE_MACOS,
     "spro2win": PROFILE_SPRO2WIN,
     "joycon2cpp": PROFILE_JOYCON2CPP,
+    "joycon2cpp-pair": PROFILE_JOYCON2CPP_PAIR,
 }
 
-# Auto-detect order (for --profile auto)
+# Auto-detect order (for --profile auto) — experimental profiles excluded
 AUTO_PROFILE_ORDER = ["macos", "spro2win", "joycon2cpp"]
 
 # ═══════════════════════════════════════════════════════════════
@@ -132,6 +148,24 @@ PRO_CONTROLLER2_PID_LE = b'\x69\x20'  # 0x2069 little-endian, for scan matching
 
 # Known GATT UUIDs (from reverse engineering — SMP_RESEARCH.md)
 COMMAND_RESPONSE_UUID = "c765a961-d9d8-4d36-a20a-5315b111836a"
+
+# Nintendo COMMAND_PAIR 0x15 subcommand IDs (CareyScott/Nadeflore)
+PAIR_CMD          = 0x15
+PAIR_SUB_SET_MAC  = 0x01
+PAIR_SUB_KEY_1    = 0x04
+PAIR_SUB_KEY_2    = 0x02
+PAIR_SUB_FINISH   = 0x03
+
+# Hardcoded pair keys (donor controller — see SMP_RESEARCH.md)
+# ⚠️ These are session-specific. May not work for all controllers.
+PAIR_KEY_1 = bytes([
+    0x00, 0xea, 0xbd, 0x47, 0x13, 0x89, 0x35, 0x42,
+    0xc6, 0x79, 0xee, 0x07, 0xf2, 0x53, 0x2c, 0x6c, 0x31,
+])
+PAIR_KEY_2 = bytes([
+    0x00, 0x40, 0xb0, 0x8a, 0x5f, 0xcd, 0x1f, 0x9b,
+    0x41, 0x12, 0x5c, 0xac, 0xc6, 0x3f, 0x38, 0xa0, 0x73,
+])
 
 # Button map: byte-level bitmasks from working implementations (SPro2Win + macOS bridge).
 # Byte 2 (right cluster): bits 0-7
@@ -380,6 +414,46 @@ def parse_reconnect_mac(reconnect_mac: bytes, host_mac: Optional[str] = None) ->
         }
 
 
+# ── Host MAC Helper ─────────────────────────────────────────────
+
+def get_host_bluetooth_mac() -> Optional[str]:
+    """Get the local Bluetooth adapter MAC address.
+
+    Tries:
+      1. /sys/class/bluetooth/hci0/address (most reliable, no deps)
+      2. hciconfig output (fallback)
+    Returns colon-separated lowercase string, or None if unavailable.
+    """
+    # Method 1: sysfs
+    addr_path = "/sys/class/bluetooth/hci0/address"
+    try:
+        with open(addr_path) as f:
+            addr = f.read().strip().lower()
+            if addr:
+                return addr
+    except (OSError, PermissionError):
+        pass
+
+    # Method 2: hciconfig
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["hciconfig", "hci0"],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in result.stdout.splitlines():
+            if "BD Address:" in line:
+                addr = line.split("BD Address:")[-1].strip().lower()
+                # Some hciconfig outputs put ACL/SCO info on the same line
+                addr = addr.split()[0] if addr else ""
+                if addr:
+                    return addr
+    except Exception:
+        pass
+
+    return None
+
+
 # ── Daemon Core ────────────────────────────────────────────────
 
 @dataclass
@@ -401,8 +475,17 @@ class DaemonState:
     paired_to_host: Optional[bool] = None     # True if reconnect_mac matches host adapter
     paired_to_other_host: Optional[bool] = None
 
+    # Pair diagnostics (joycon2cpp-pair profile)
+    host_mac: Optional[str] = None            # local Bluetooth adapter MAC
+    pair_sequence_ok: bool = False            # True if all 4 pair steps succeeded
+    pair_failure_step: Optional[str] = None   # which step failed (setmac/key1/key2/finish)
+    pair_responses: List[str] = field(default_factory=list)  # raw hex responses from controller
+
     # Active profile — always set before any stage function runs
     active_profile: ProtocolProfile = field(default_factory=lambda: PROFILE_MACOS)
+
+    # Session-level (reset per attempt)
+    command_response_subscribed: bool = False  # True if COMMAND_RESPONSE_UUID subscribed
 
     # Runtime stats
     report_count: int = 0
@@ -448,13 +531,17 @@ class DaemonState:
         self.command_response_handle = None
         self.input_report_handle = None
         self.input_report_uuid = None
+        self.command_response_subscribed = False
+        self.pair_sequence_ok = False
+        self.pair_failure_step = None
+        self.pair_responses.clear()
         self.disconnect_event.clear()
         self.notify_event.clear()
 
     def exit_code_for_stage(self, stage: str) -> int:
         codes = {
             "preflight": 10, "scan": 11, "connect": 12,
-            "discover": 13, "init": 14, "subscribe": 15, "running": 16,
+            "discover": 13, "pair": 17, "init": 14, "subscribe": 15, "running": 16,
         }
         return codes.get(stage, 99)
 
@@ -672,6 +759,14 @@ async def stage_discover(state: DaemonState) -> bool:
                         services=service_count, chars=char_count)
         return False
 
+    # ── Pair profiles: subscribe to COMMAND_RESPONSE_UUID ──
+    if profile.name.endswith("-pair") and state.command_response_handle:
+        if not await _subscribe_command_response(state):
+            state.log.stage("discover", "fail",
+                            reason="COMMAND_RESPONSE_UUID subscribe failed",
+                            services=service_count, chars=char_count)
+            return False
+
     state.stage_discover_ok = True
     state.log.stage("discover", "ok",
                     services=service_count, chars=char_count,
@@ -679,6 +774,128 @@ async def stage_discover(state: DaemonState) -> bool:
                     cmd_handle=state.cmd_write_handle,
                     cmd_response_handle=state.command_response_handle)
     return True
+
+
+# ── Pair Response Helper ────────────────────────────────────────
+
+async def _subscribe_command_response(state: DaemonState) -> bool:
+    """Subscribe to COMMAND_RESPONSE_UUID notifications for pair response collection."""
+    if state.command_response_subscribed:
+        return True
+
+    state.log.info(f"subscribing to COMMAND_RESPONSE_UUID handle={state.command_response_handle}")
+    try:
+        await state.client.start_notify(
+            COMMAND_RESPONSE_UUID,
+            lambda _sender, data: state.pair_responses.append(bytes(data).hex()),
+        )
+        state.command_response_subscribed = True
+        state.log.info("  ← command response subscribed")
+        return True
+    except Exception as e:
+        state.log.error(f"  ← command response subscribe failed: {e}")
+        return False
+
+
+# ── Stage: Pair (experimental, joycon2cpp-pair only) ────────────
+
+def _build_setmac_payload(host_mac: str) -> bytes:
+    """Build SetMAC pair subcommand data: 0x00 0x02 + host_mac + host_mac."""
+    mac_bytes = bytes.fromhex(host_mac.replace(':', ''))
+    return b'\x00\x02' + mac_bytes + mac_bytes
+
+
+async def stage_pair(state: DaemonState) -> bool:
+    """Send Nintendo COMMAND_PAIR 0x15 sequence: SetMAC → LTK1 → LTK2 → Finish.
+
+    Waits for a response on COMMAND_RESPONSE_UUID after each step.
+    Only active for profiles ending in '-pair'.
+    """
+    profile = state.active_profile
+    if not profile.name.endswith("-pair"):
+        state.log.stage("pair", "ok", skipped=f"profile={profile.name} does not support pairing")
+        return True
+
+    state.log.stage("pair", "start", profile=profile.name)
+
+    # Determine host MAC
+    state.host_mac = get_host_bluetooth_mac()
+    if not state.host_mac:
+        state.log.error("cannot determine host Bluetooth MAC for pairing")
+        state.pair_failure_step = "host_mac"
+        return False
+    state.log.info(f"host MAC: {state.host_mac}")
+
+    if not state.cmd_write_handle:
+        state.log.error("no command write handle — cannot send pair commands")
+        state.pair_failure_step = "no_cmd_handle"
+        return False
+
+    if not state.command_response_handle:
+        state.log.warn("no COMMAND_RESPONSE_UUID found — cannot receive pair responses")
+        # Continue anyway — controller may respond via other means
+
+    pair_steps = [
+        ("setmac", PAIR_SUB_SET_MAC, _build_setmac_payload(state.host_mac)),
+        ("key1",   PAIR_SUB_KEY_1,   PAIR_KEY_1),
+        ("key2",   PAIR_SUB_KEY_2,   PAIR_KEY_2),
+        ("finish", PAIR_SUB_FINISH,  b'\x00'),
+    ]
+
+    response_base = len(state.pair_responses)  # count responses already collected
+
+    for step_name, sub_id, sub_data in pair_steps:
+        payload = build_command(PAIR_CMD, sub_id, sub_data)
+        state.log.info(f"  → pair {step_name}: {payload.hex(' ')}")
+        try:
+            await state.client.write_gatt_char(profile.command_uuid, payload, response=False)
+        except Exception as e:
+            state.log.error(f"  ← pair {step_name}: write failed: {e}")
+            state.pair_failure_step = step_name
+            return False
+
+        # Wait for response from controller
+        if state.command_response_subscribed:
+            state.log.info(f"  … waiting for {step_name} response (500ms)…")
+            await asyncio.sleep(0.5)
+            new_responses = len(state.pair_responses) - response_base
+            if new_responses == 0:
+                state.log.warn(f"  ← pair {step_name}: no response received within timeout")
+            else:
+                latest = state.pair_responses[-1]
+                state.log.info(f"  ← pair {step_name}: response = {latest}")
+        else:
+            # No response channel — just wait and hope
+            await asyncio.sleep(0.1)
+
+    # Verify: we should have at least 1 response (finish typically responds)
+    total_responses = len(state.pair_responses) - response_base
+    if total_responses > 0:
+        state.pair_sequence_ok = True
+        state.log.stage("pair", "ok",
+                        steps=len(pair_steps),
+                        responses=total_responses,
+                        host_mac=state.host_mac)
+        return True
+    elif state.command_response_subscribed:
+        # Subscribed but no responses — pair may have failed silently
+        state.log.stage("pair", "warn",
+                        reason="pair commands sent, no responses received. Controller may not support donor keys.",
+                        steps=len(pair_steps),
+                        responses=0,
+                        host_mac=state.host_mac)
+        # Continue anyway — the init sequence may still work
+        state.pair_sequence_ok = True
+        return True
+    else:
+        # No response channel at all — assume success
+        state.pair_sequence_ok = True
+        state.log.stage("pair", "ok",
+                        steps=len(pair_steps),
+                        responses=0,
+                        host_mac=state.host_mac,
+                        note="no response channel available; assuming pair succeeded")
+        return True
 
 
 # ── Stage: Init ────────────────────────────────────────────────
@@ -902,6 +1119,13 @@ async def run_session(state: DaemonState, profile: Optional[ProtocolProfile] = N
         ("scan", stage_scan),
         ("connect", stage_connect),
         ("discover", stage_discover),
+    ]
+
+    # Insert pair stage for pair profiles (after discover, before init)
+    if state.active_profile.name.endswith("-pair"):
+        stages.append(("pair", stage_pair))
+
+    stages += [
         ("init", stage_init),
         ("subscribe", stage_subscribe),
     ]
@@ -1070,6 +1294,7 @@ async def auto_detect_mode(state: DaemonState) -> int:
         "winning_profile": winner,
         "stages": stages,
         "device": state.device.address if state.device else None,
+        "host_mac": state.host_mac,
         "input_uuid": state.input_report_uuid,
         "input_handle": state.input_report_handle,
         "command_response_handle": state.command_response_handle,
@@ -1078,6 +1303,9 @@ async def auto_detect_mode(state: DaemonState) -> int:
         "pairing_mode": state.pairing_mode,
         "paired_to_host": state.paired_to_host,
         "paired_to_other_host": state.paired_to_other_host,
+        "pair_sequence_ok": state.pair_sequence_ok if state.pair_sequence_ok else None,
+        "pair_failure_step": state.pair_failure_step,
+        "pair_responses": state.pair_responses if state.pair_responses else None,
         "report_count": state.report_count if winner else 0,
         "first_report_hex": state.first_report_hex,
         "last_report_hex": state.last_report_hex,
@@ -1132,6 +1360,7 @@ async def diagnose_mode(state: DaemonState) -> int:
         "profile": profile.name,
         "stages": stages,
         "device": state.device.address if state.device else None,
+        "host_mac": state.host_mac,
         "input_uuid": state.input_report_uuid,
         "input_handle": state.input_report_handle,
         "command_response_handle": state.command_response_handle,
@@ -1140,6 +1369,9 @@ async def diagnose_mode(state: DaemonState) -> int:
         "pairing_mode": state.pairing_mode,
         "paired_to_host": state.paired_to_host,
         "paired_to_other_host": state.paired_to_other_host,
+        "pair_sequence_ok": state.pair_sequence_ok or None,
+        "pair_failure_step": state.pair_failure_step,
+        "pair_responses": state.pair_responses if state.pair_responses else None,
         "report_count": state.report_count,
         "first_report_hex": state.first_report_hex,
         "last_report_hex": state.last_report_hex,
@@ -1195,6 +1427,7 @@ Profiles:
   macos          Selected notify on UUID 7492866c (switch2bridge-macos).
   spro2win       Subscribe-all notify, filter handle 45 (SPro2Win).
   joycon2cpp     Init writes + selected notify on ab7de9be (joycon2cpp).
+  joycon2cpp-pair  ⚠️ EXPERIMENTAL: COMMAND_PAIR 0x15 + init (CareyScott/Nadeflore donor keys).
 
 Examples:
   %(prog)s --diagnose --verbose                     # auto-detect
@@ -1212,8 +1445,9 @@ Examples:
 
     # Profile
     p.add_argument("--profile", type=str, default="auto",
-                   choices=("auto", "macos", "spro2win", "joycon2cpp"),
-                   help="Protocol profile. auto=sequential fallback, macos/spro2win/joycon2cpp=explicit. "
+                   choices=("auto", "macos", "spro2win", "joycon2cpp", "joycon2cpp-pair"),
+                   help="Protocol profile. auto=sequential fallback, "
+                        "macos/spro2win/joycon2cpp/joycon2cpp-pair=explicit. "
                         "Default: auto for --diagnose, macos for --daemon.")
 
     # Scan

@@ -1,6 +1,6 @@
 # Protocol Profiles — Source Documentation
 
-`switch2d.py` v5.0 implements three protocol profiles, each derived from a
+`switch2d.py` v5.0 implements four protocol profiles (three production + one experimental), each derived from a
 documented working implementation on another platform. This document explains
 where each profile came from and what is implemented.
 
@@ -11,6 +11,7 @@ where each profile came from and what is implemented.
 | `macos` | [switch2bridge-macos](https://github.com/mlstr0m/switch2bridge-macos) | macOS (CoreBluetooth) | Selected notify | `7492866c-ec3e-4619-8258-32755ffcc0f9` | None | None |
 | `spro2win` | [SPro2Win](https://github.com/SquareDonut1/SPro2Win) | Windows (bleak) | Subscribe-all | None (any notify char) | None | Handle 45 |
 | `joycon2cpp` | [joycon2cpp](https://github.com/TheFrano/joycon2cpp) | Windows (bleak) | Selected notify + init | `ab7de9be-89fe-49ad-828f-118f09df7fd2` | Feature-select 0x02, 0x04 + LED + Sound | None |
+| `joycon2cpp-pair` ⚠️ | CareyScott + Nadeflore + joycon2cpp | Linux (bleak, EXPERIMENTAL) | COMMAND_PAIR 0x15 + init + notify | `ab7de9be-89fe-49ad-828f-118f09df7fd2` | SetMAC→LTK1→LTK2→Finish + joycon2cpp init | None |
 
 ## Profile: `macos`
 

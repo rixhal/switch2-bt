@@ -97,9 +97,9 @@ class TestProfileStructure:
         assert PROFILE_JOYCON2CPP.command_uuid == "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
 
     def test_all_profiles_registered(self):
-        """All three profiles are in PROTOCOL_PROFILES dict."""
-        assert set(PROTOCOL_PROFILES.keys()) == {"macos", "spro2win", "joycon2cpp"}
-
+        """All expected profiles are in PROTOCOL_PROFILES."""
+        expected = {"macos", "spro2win", "joycon2cpp", "joycon2cpp-pair"}
+        assert set(PROTOCOL_PROFILES.keys()) == expected
     def test_all_profiles_are_protocol_profile_instances(self):
         """Every registered profile is a ProtocolProfile dataclass."""
         for name, profile in PROTOCOL_PROFILES.items():
