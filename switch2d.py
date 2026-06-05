@@ -940,18 +940,28 @@ async def auto_detect_mode(state: DaemonState) -> int:
         telemetry["interval_avg_ms"] = round(sum(intervals) / len(intervals), 1)
 
     winner = state.winning_profile
+    stages = {
+        "scan": state.stage_scan_ok,
+        "connect": state.stage_connect_ok,
+        "discover": state.stage_discover_ok,
+        "subscribe": state.stage_subscribe_ok,
+        "reports": state.stage_reports_ok,
+        "uinput": state.uinput is not None,
+    }
     summary: Dict[str, Any] = {
         "exit_code": 0 if winner else 16,
         "mode": "auto",
         "attempted_profiles": state.attempted_profiles,
         "winning_profile": winner,
+        "stages": stages,
+        "device": state.device.address if state.device else None,
+        "input_uuid": state.input_report_uuid,
+        "input_handle": state.input_report_handle,
         "report_count": state.report_count if winner else 0,
         "first_report_hex": state.first_report_hex,
+        "last_report_hex": state.last_report_hex,
         "telemetry": telemetry,
     }
-
-    if state.uinput is not None:
-        summary["uinput"] = True
 
     print(json.dumps(summary, indent=2), flush=True)
 
