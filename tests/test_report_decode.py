@@ -1,181 +1,252 @@
-"""Tests for full report decoding: decode_report.
+"""Tests for decode_report with byte-level button parsing.
 
-Report format (≥0x3C bytes):
-  bytes 0-2:   packet ID (24-bit LE)
-  bytes 3-8:   buttons (48-bit BE bitfield)
-  bytes 10-12: left stick (12-bit packed X,Y)
-  bytes 13-15: right stick (12-bit packed X,Y)
-  bytes 0x30-0x35: accelerometer (3x s16 LE)
-  bytes 0x36-0x3B: gyroscope (3x s16 LE)
+Report format (new byte-level model):
+  bytes 0-1:   packet_id (16-bit LE)
+  byte 2:      right cluster buttons (8 bits)
+  byte 3:      left cluster buttons (8 bits)
+  byte 4:      system + grip buttons (8 bits)
+  bytes 5-7:   left stick (12-bit packed X,Y)
+  bytes 8-10:  right stick (12-bit packed X,Y)
+  bytes 11+:   optional; accel/gyro only in >= 0x3C byte reports
 """
 
 import pytest
-from switch2d import decode_report, PROCON2_BUTTON_MASKS
+from switch2d import decode_report, BUTTON_MAP
 
 
-# Helpers ---------------------------------------------------------
+# ── Helpers ─────────────────────────────────────────────────────
 
-def make_report(button_bytes=(0, 0, 0, 0, 0, 0),
-                left_stick=(2048, 2048),
-                right_stick=(2048, 2048),
-                packet_id=0,
-                accel=(0, 0, 0),
-                gyro=(0, 0, 0)) -> bytes:
-    """Build a 60-byte (0x3C) report with known field values.
+def _pack_stick(x: int, y: int) -> bytes:
+    """Pack 12-bit stick values into 3 bytes (same format as decode_stick12)."""
+    return bytes([
+        x & 0xFF,
+        ((y & 0x0F) << 4) | ((x >> 8) & 0x0F),
+        (y >> 4) & 0xFF,
+    ])
 
-    button_bytes: tuple of 6 bytes for bytes 3-8 (48-bit BE button bitfield).
-    left_stick: (x, y) 12-bit values packed into bytes 10-12.
-    right_stick: (x, y) 12-bit values packed into bytes 13-15.
+
+def build_report(byte2: int = 0, byte3: int = 0, byte4: int = 0,
+                 left_stick: tuple = (2048, 2048),
+                 right_stick: tuple = (2048, 2048),
+                 packet_id: int = 0,
+                 include_imu: bool = False,
+                 accel: tuple = (0, 0, 0),
+                 gyro: tuple = (0, 0, 0)) -> bytes:
+    """Build a Switch 2 Pro Controller input report.
+
+    Minimum 11 bytes. When include_imu=True, builds a full 0x3C-byte report
+    with accelerometer and gyroscope data at the standard offsets.
     """
-    buf = bytearray(60)  # 0x3C zero-filled
+    length = 0x3C if include_imu else 11
+    buf = bytearray(length)
 
-    # Packet ID (24-bit LE, bytes 0-2)
-    buf[0:3] = packet_id.to_bytes(3, "little")
+    # Packet ID (2 bytes LE)
+    buf[0:2] = packet_id.to_bytes(2, "little")
 
-    # Buttons (48-bit BE, bytes 3-8)
-    buf[3:9] = button_bytes
+    # Buttons (bytes 2, 3, 4)
+    buf[2] = byte2
+    buf[3] = byte3
+    buf[4] = byte4
 
-    # Left stick (bytes 10-12)
-    lx, ly = left_stick
-    buf[10] = lx & 0xFF
-    buf[11] = ((ly & 0x0F) << 4) | ((lx >> 8) & 0x0F)
-    buf[12] = (ly >> 4) & 0xFF
+    # Left stick (bytes 5-7)
+    buf[5:8] = _pack_stick(*left_stick)
 
-    # Right stick (bytes 13-15)
-    rx, ry = right_stick
-    buf[13] = rx & 0xFF
-    buf[14] = ((ry & 0x0F) << 4) | ((rx >> 8) & 0x0F)
-    buf[15] = (ry >> 4) & 0xFF
+    # Right stick (bytes 8-10)
+    buf[8:11] = _pack_stick(*right_stick)
 
-    # Accel (3x s16 LE, bytes 0x30-0x35)
-    for i, val in enumerate(accel):
-        off = 0x30 + i * 2
-        buf[off:off + 2] = val.to_bytes(2, "little", signed=True)
-
-    # Gyro (3x s16 LE, bytes 0x36-0x3B)
-    for i, val in enumerate(gyro):
-        off = 0x36 + i * 2
-        buf[off:off + 2] = val.to_bytes(2, "little", signed=True)
+    # Accel / Gyro (only in full reports)
+    if include_imu:
+        for i, val in enumerate(accel):
+            off = 0x30 + i * 2
+            buf[off:off + 2] = val.to_bytes(2, "little", signed=True)
+        for i, val in enumerate(gyro):
+            off = 0x36 + i * 2
+            buf[off:off + 2] = val.to_bytes(2, "little", signed=True)
 
     return bytes(buf)
 
 
-def button_bytes_from_mask(mask: int) -> tuple:
-    """Convert a 48-bit mask to 6 big-endian bytes (bytes 3-8)."""
-    return tuple((mask >> (40 - i * 8)) & 0xFF for i in range(6))
+def _buttons_for(*names: str) -> tuple:
+    """Return (byte2, byte3, byte4) from button names using BUTTON_MAP."""
+    b2, b3, b4 = 0, 0, 0
+    for name in names:
+        byte_idx, mask = BUTTON_MAP[name]
+        if byte_idx == 2:
+            b2 |= mask
+        elif byte_idx == 3:
+            b3 |= mask
+        elif byte_idx == 4:
+            b4 |= mask
+    return b2, b3, b4
 
 
-# Tests -----------------------------------------------------------
+# ── Tests ───────────────────────────────────────────────────────
 
 class TestDecodeReport:
-    """Full report decoder tests."""
+    """Full report decoder tests with byte-level button parsing."""
 
-    # --- Short / empty reports ---
+    # ── Short / invalid reports ─────────────────────────────
 
-    def test_empty_report(self):
+    def test_empty_data_returns_none(self):
         """Empty bytes returns None."""
         assert decode_report(b"") is None
 
-    def test_short_report(self):
-        """Report shorter than 0x3C (60) bytes returns None."""
-        assert decode_report(bytes(59)) is None
+    def test_too_short_10_bytes(self):
+        """10 bytes (below 11-byte minimum) returns None."""
         assert decode_report(bytes(10)) is None
+
+    def test_too_short_5_bytes(self):
+        """5 bytes returns None."""
+        assert decode_report(bytes(5)) is None
+
+    def test_too_short_1_byte(self):
+        """1 byte returns None."""
         assert decode_report(bytes(1)) is None
 
-    def test_exactly_minimum_length(self):
-        """Exactly 0x3C bytes decodes without error."""
-        result = decode_report(bytes(60))
+    def test_exactly_11_bytes_valid(self):
+        """Exactly 11 bytes decodes without error."""
+        result = decode_report(build_report())
         assert result is not None
         assert result["packet_id"] == 0
-        assert result["button_state"] == "0x000000000000"
         assert result["pressed"] == []
         assert result["left_stick"] is not None
         assert result["right_stick"] is not None
 
-    # --- Buttons ---
-
-    def test_no_buttons(self):
-        """All-zero report has no pressed buttons."""
-        result = decode_report(make_report())
+    def test_12_bytes_valid(self):
+        """Report between 11 and 0x3C bytes still decodes."""
+        buf = bytearray(12)
+        buf[5:8] = _pack_stick(2048, 2048)
+        buf[8:11] = _pack_stick(2048, 2048)
+        result = decode_report(bytes(buf))
         assert result is not None
         assert result["pressed"] == []
-        assert result["button_state"] == "0x000000000000"
 
-    def test_button_a(self):
-        """Button 'a' pressed (mask 0x000800000000)."""
-        mask = PROCON2_BUTTON_MASKS["a"]
-        bb = button_bytes_from_mask(mask)
-        result = decode_report(make_report(button_bytes=bb))
-        assert result is not None
-        assert "a" in result["pressed"]
-        assert len(result["pressed"]) == 1
+    # ── Packet ID ───────────────────────────────────────────
 
-    def test_button_b(self):
-        """Button 'b' pressed (mask 0x000400000000)."""
-        mask = PROCON2_BUTTON_MASKS["b"]
-        result = decode_report(make_report(button_bytes=button_bytes_from_mask(mask)))
-        assert result is not None
-        assert result["pressed"] == ["b"]
+    def test_packet_id_zero(self):
+        result = decode_report(build_report(packet_id=0))
+        assert result["packet_id"] == 0
 
-    def test_button_home(self):
-        """Button 'home' pressed (mask 0x000010000000)."""
-        mask = PROCON2_BUTTON_MASKS["home"]
-        result = decode_report(make_report(button_bytes=button_bytes_from_mask(mask)))
-        assert result is not None
-        assert result["pressed"] == ["home"]
+    def test_packet_id_nonzero(self):
+        result = decode_report(build_report(packet_id=0x1234))
+        assert result["packet_id"] == 0x1234
 
-    def test_multiple_buttons(self):
-        """Multiple buttons pressed simultaneously (a + b + x)."""
-        mask = (PROCON2_BUTTON_MASKS["a"] |
-                PROCON2_BUTTON_MASKS["b"] |
-                PROCON2_BUTTON_MASKS["x"])
-        result = decode_report(make_report(button_bytes=button_bytes_from_mask(mask)))
-        assert result is not None
-        assert set(result["pressed"]) == {"a", "b", "x"}
+    def test_packet_id_max_16bit(self):
+        result = decode_report(build_report(packet_id=0xFFFF))
+        assert result["packet_id"] == 0xFFFF
 
-    def test_all_dpad_buttons(self):
-        """All d-pad directions pressed."""
-        mask = (PROCON2_BUTTON_MASKS["dpad_up"] |
-                PROCON2_BUTTON_MASKS["dpad_down"] |
-                PROCON2_BUTTON_MASKS["dpad_left"] |
-                PROCON2_BUTTON_MASKS["dpad_right"])
-        result = decode_report(make_report(button_bytes=button_bytes_from_mask(mask)))
+    # ── No buttons pressed ──────────────────────────────────
+
+    def test_no_buttons_pressed(self):
+        """All-zero button bytes → empty pressed list."""
+        result = decode_report(build_report())
         assert result is not None
+        assert result["pressed"] == []
+
+    # ── Byte 2 buttons (right cluster) ──────────────────────
+    #   b=0x01, a=0x02, y=0x04, x=0x08,
+    #   r=0x10, zr=0x20, start=0x40, r3=0x80
+
+    @pytest.mark.parametrize("name,mask", [
+        ("b", 0x01),
+        ("a", 0x02),
+        ("y", 0x04),
+        ("x", 0x08),
+        ("r", 0x10),
+        ("zr", 0x20),
+        ("start", 0x40),
+        ("r3", 0x80),
+    ])
+    def test_byte2_button_individual(self, name, mask):
+        """Each byte-2 button is detected when its bit is set."""
+        b2, b3, b4 = _buttons_for(name)
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
+        assert result["pressed"] == [name]
+
+    # ── Byte 3 buttons (left cluster) ───────────────────────
+    #   dpad_down=0x01, dpad_right=0x02, dpad_left=0x04, dpad_up=0x08,
+    #   l=0x10, zl=0x20, back=0x40, l3=0x80
+
+    @pytest.mark.parametrize("name,mask", [
+        ("dpad_down", 0x01),
+        ("dpad_right", 0x02),
+        ("dpad_left", 0x04),
+        ("dpad_up", 0x08),
+        ("l", 0x10),
+        ("zl", 0x20),
+        ("back", 0x40),
+        ("l3", 0x80),
+    ])
+    def test_byte3_button_individual(self, name, mask):
+        """Each byte-3 button is detected when its bit is set."""
+        b2, b3, b4 = _buttons_for(name)
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
+        assert result["pressed"] == [name]
+
+    # ── Byte 4 buttons (system + grip) ──────────────────────
+    #   home=0x01, c=0x02, gr=0x04, gl=0x08, screenshot=0x10
+
+    @pytest.mark.parametrize("name,mask", [
+        ("home", 0x01),
+        ("c", 0x02),
+        ("gr", 0x04),
+        ("gl", 0x08),
+        ("screenshot", 0x10),
+    ])
+    def test_byte4_button_individual(self, name, mask):
+        """Each byte-4 button is detected when its bit is set."""
+        b2, b3, b4 = _buttons_for(name)
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
+        assert result["pressed"] == [name]
+
+    # ── Multiple buttons across bytes ───────────────────────
+
+    def test_multiple_buttons_byte2(self):
+        """Multiple byte-2 buttons simultaneously (a + b + x + y)."""
+        b2, b3, b4 = _buttons_for("a", "b", "x", "y")
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
+        assert set(result["pressed"]) == {"a", "b", "x", "y"}
+
+    def test_multiple_buttons_byte3(self):
+        """Multiple byte-3 buttons simultaneously (all dpad directions)."""
+        b2, b3, b4 = _buttons_for("dpad_up", "dpad_down", "dpad_left", "dpad_right")
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
         assert set(result["pressed"]) == {"dpad_up", "dpad_down", "dpad_left", "dpad_right"}
 
     def test_shoulder_buttons(self):
-        """L, R, ZL, ZR pressed."""
-        mask = (PROCON2_BUTTON_MASKS["l"] |
-                PROCON2_BUTTON_MASKS["r"] |
-                PROCON2_BUTTON_MASKS["zl"] |
-                PROCON2_BUTTON_MASKS["zr"])
-        result = decode_report(make_report(button_bytes=button_bytes_from_mask(mask)))
-        assert result is not None
+        """L, R, ZL, ZR across bytes 2 and 3."""
+        b2, b3, b4 = _buttons_for("l", "r", "zl", "zr")
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
         assert set(result["pressed"]) == {"l", "r", "zl", "zr"}
 
+    def test_buttons_across_all_bytes(self):
+        """Buttons across bytes 2, 3, and 4 simultaneously."""
+        names = ["a", "dpad_up", "home"]
+        b2, b3, b4 = _buttons_for(*names)
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
+        assert set(result["pressed"]) == set(names)
+
     def test_all_buttons(self):
-        """All known button masks OR'd together."""
-        mask = 0
-        for m in PROCON2_BUTTON_MASKS.values():
-            mask |= m
-        result = decode_report(make_report(button_bytes=button_bytes_from_mask(mask)))
-        assert result is not None
-        assert set(result["pressed"]) == set(PROCON2_BUTTON_MASKS.keys())
+        """All known buttons pressed at once."""
+        all_names = list(BUTTON_MAP.keys())
+        b2, b3, b4 = _buttons_for(*all_names)
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
+        assert set(result["pressed"]) == set(all_names)
 
-    def test_button_state_hex_format(self):
-        """button_state is a 12-hex-digit zero-prefixed string."""
-        mask = PROCON2_BUTTON_MASKS["a"]
-        result = decode_report(make_report(button_bytes=button_bytes_from_mask(mask)))
-        assert result is not None
-        assert result["button_state"] == "0x000800000000"
-        assert len(result["button_state"]) == 14  # "0x" + 12 hex digits
+    # ── Button ordering ─────────────────────────────────────
 
-    # --- Sticks ---
+    def test_button_order_matches_map_order(self):
+        """Pressed buttons are returned in BUTTON_MAP insertion order."""
+        # Press b (first in map) and screenshot (last in map)
+        b2, b3, b4 = _buttons_for("b", "screenshot")
+        result = decode_report(build_report(byte2=b2, byte3=b3, byte4=b4))
+        assert result["pressed"] == ["b", "screenshot"]
+
+    # ── Sticks ──────────────────────────────────────────────
 
     def test_sticks_center(self):
         """Both sticks at center (2048, 2048)."""
-        result = decode_report(make_report())
-        assert result is not None
+        result = decode_report(build_report())
         assert result["left_stick"]["x"] == 2048
         assert result["left_stick"]["y"] == 2048
         assert result["left_stick"]["x_norm"] == 0.0
@@ -184,89 +255,77 @@ class TestDecodeReport:
         assert result["right_stick"]["y"] == 2048
 
     def test_left_stick_full_left(self):
-        """Left stick at x=0, y=center."""
-        result = decode_report(make_report(left_stick=(0, 2048)))
-        assert result is not None
+        """Left stick x=0, y=center."""
+        result = decode_report(build_report(left_stick=(0, 2048)))
         assert result["left_stick"]["x"] == 0
         assert result["left_stick"]["y"] == 2048
         assert result["left_stick"]["x_norm"] == pytest.approx(-2048 / 2047, abs=1e-3)
         assert result["left_stick"]["y_norm"] == 0.0
 
     def test_left_stick_full_right(self):
-        """Left stick at x=4095, y=center."""
-        result = decode_report(make_report(left_stick=(4095, 2048)))
-        assert result is not None
+        """Left stick x=4095, y=center."""
+        result = decode_report(build_report(left_stick=(4095, 2048)))
         assert result["left_stick"]["x"] == 4095
         assert result["left_stick"]["x_norm"] == pytest.approx(2047 / 2047, abs=1e-3)
 
     def test_right_stick_full_up(self):
-        """Right stick at x=center, y=4095."""
-        result = decode_report(make_report(right_stick=(2048, 4095)))
-        assert result is not None
+        """Right stick x=center, y=4095."""
+        result = decode_report(build_report(right_stick=(2048, 4095)))
         assert result["right_stick"]["x"] == 2048
         assert result["right_stick"]["y"] == 4095
         assert result["right_stick"]["y_norm"] == pytest.approx(2047 / 2047, abs=1e-3)
 
     def test_right_stick_full_down(self):
-        """Right stick at x=center, y=0."""
-        result = decode_report(make_report(right_stick=(2048, 0)))
-        assert result is not None
+        """Right stick x=center, y=0."""
+        result = decode_report(build_report(right_stick=(2048, 0)))
         assert result["right_stick"]["y"] == 0
         assert result["right_stick"]["y_norm"] == pytest.approx(-2048 / 2047, abs=1e-3)
 
-    # --- Packet ID ---
+    # ── 11-byte vs 0x3C-byte (IMU) ──────────────────────────
 
-    def test_packet_id_zero(self):
-        """Default zero packet ID."""
-        result = decode_report(make_report(packet_id=0))
+    def test_11_byte_report_no_imu(self):
+        """11-byte report has no accel or gyro keys."""
+        result = decode_report(build_report())
         assert result is not None
-        assert result["packet_id"] == 0
+        assert "accel" not in result
+        assert "gyro" not in result
 
-    def test_packet_id_nonzero(self):
-        """Non-zero packet ID (24-bit LE)."""
-        result = decode_report(make_report(packet_id=0x123456))
+    def test_0x3C_report_has_imu(self):
+        """0x3C-byte report includes accel and gyro keys."""
+        result = decode_report(build_report(include_imu=True))
         assert result is not None
-        assert result["packet_id"] == 0x123456
+        assert "accel" in result
+        assert "gyro" in result
 
-    def test_packet_id_max(self):
-        """Max 24-bit packet ID."""
-        result = decode_report(make_report(packet_id=0xFFFFFF))
-        assert result is not None
-        assert result["packet_id"] == 0xFFFFFF
-
-    # --- Accel / Gyro ---
-
-    def test_accel_zero(self):
-        """Accelerometer defaults to (0, 0, 0)."""
-        result = decode_report(make_report())
-        assert result is not None
+    def test_0x3C_report_accel_zero(self):
+        """Default accel is (0, 0, 0)."""
+        result = decode_report(build_report(include_imu=True))
         assert result["accel"] == {"x": 0, "y": 0, "z": 0}
 
-    def test_accel_values(self):
-        """Known accelerometer values."""
-        result = decode_report(make_report(accel=(100, -200, 300)))
-        assert result is not None
+    def test_0x3C_report_accel_values(self):
+        """Known accelerometer values round-trip."""
+        result = decode_report(build_report(
+            include_imu=True, accel=(100, -200, 300)))
         assert result["accel"] == {"x": 100, "y": -200, "z": 300}
 
-    def test_gyro_zero(self):
-        """Gyroscope defaults to (0, 0, 0)."""
-        result = decode_report(make_report())
-        assert result is not None
+    def test_0x3C_report_gyro_zero(self):
+        """Default gyro is (0, 0, 0)."""
+        result = decode_report(build_report(include_imu=True))
         assert result["gyro"] == {"x": 0, "y": 0, "z": 0}
 
-    def test_gyro_values(self):
-        """Known gyroscope values."""
-        result = decode_report(make_report(gyro=(-32768, 0, 32767)))
-        assert result is not None
+    def test_0x3C_report_gyro_values(self):
+        """Known gyroscope values round-trip."""
+        result = decode_report(build_report(
+            include_imu=True, gyro=(-32768, 0, 32767)))
         assert result["gyro"] == {"x": -32768, "y": 0, "z": 32767}
 
-    def test_accel_gyro_combined(self):
+    def test_0x3C_report_accel_gyro_combined(self):
         """Both accel and gyro with non-zero values."""
-        result = decode_report(make_report(
+        result = decode_report(build_report(
+            include_imu=True,
             accel=(1234, -5678, 9012),
             gyro=(-1234, 5678, -9012),
         ))
-        assert result is not None
         assert result["accel"]["x"] == 1234
         assert result["accel"]["y"] == -5678
         assert result["accel"]["z"] == 9012
@@ -274,29 +333,42 @@ class TestDecodeReport:
         assert result["gyro"]["y"] == 5678
         assert result["gyro"]["z"] == -9012
 
-    # --- Larger than minimum report ---
-
-    def test_larger_report(self):
-        """Report larger than 0x3C bytes still decodes correctly."""
-        result = decode_report(bytes(100))
+    def test_30_byte_report_no_imu(self):
+        """Report >= 11 but < 0x3C has no accel/gyro."""
+        buf = bytearray(30)
+        buf[5:8] = _pack_stick(2048, 2048)
+        buf[8:11] = _pack_stick(2048, 2048)
+        result = decode_report(bytes(buf))
         assert result is not None
-        assert result["packet_id"] == 0
+        assert "accel" not in result
+        assert "gyro" not in result
 
-    # --- Button bitfield byte-level verification ---
+    # ── Larger than 0x3C ────────────────────────────────────
 
-    def test_button_bitfield_byte_ordering(self):
-        """Verify that the 6 button bytes are interpreted as 48-bit BE."""
-        # byte 3 is MSB, byte 8 is LSB
-        # Set only bit 0 of the 48-bit field → byte 8 = 0x01
-        bb = (0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
-        result = decode_report(make_report(button_bytes=bb))
+    def test_larger_than_0x3C(self):
+        """Report > 0x3C bytes still decodes correctly."""
+        result = decode_report(build_report(include_imu=True))
         assert result is not None
-        # bit 0 corresponds to... let's check: dpad_down = 0x000000010000
-        # 0x000000010000 in 48 bits:
-        # byte 3=0x00, byte 4=0x00, byte 5=0x01, byte 6=0x00, byte 7=0x00, byte 8=0x00
-        # So bit 0 of 48-bit field → byte8 bit 0, which is NOT dpad_down
-        # Let's check: 0x000000010000 → byte 5 = 0x01
-        # Our bb puts 0x01 at byte 8, which means bit 0 of the 48-bit field
-        # 0x000000000001 → this is just bit 0, no named button
-        assert result["pressed"] == []
-        assert result["button_state"] == "0x000000000001"
+        assert "accel" in result
+        assert "gyro" in result
+
+    # ── No button_state field ───────────────────────────────
+
+    def test_no_button_state_field(self):
+        """New decoder does not include 'button_state' hex field."""
+        result = decode_report(build_report())
+        assert "button_state" not in result
+
+    # ── Sticks at correct new byte offsets ──────────────────
+
+    def test_left_stick_at_bytes_5_to_7(self):
+        """Left stick is at bytes 5-7, not the old 10-12 offset."""
+        result = decode_report(build_report(left_stick=(0, 4095)))
+        assert result["left_stick"]["x"] == 0
+        assert result["left_stick"]["y"] == 4095
+
+    def test_right_stick_at_bytes_8_to_10(self):
+        """Right stick is at bytes 8-10, not the old 13-15 offset."""
+        result = decode_report(build_report(right_stick=(4095, 0)))
+        assert result["right_stick"]["x"] == 4095
+        assert result["right_stick"]["y"] == 0

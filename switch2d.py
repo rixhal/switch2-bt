@@ -51,25 +51,45 @@ except ImportError:
 NINTENDO_MFR_ID        = 0x0553
 NINTENDO_VID           = 0x057E
 PRO_CONTROLLER2_PID    = 0x2069
+PRO_CONTROLLER2_PID_LE = b'\x69\x20'  # 0x2069 little-endian, for scan matching
 
-UUID_INPUT_REPORT      = "ab7de9be-89fe-49ad-828f-118f09df7fd2"
-UUID_COMMAND_WRITE     = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
-UUID_COMMAND_RESPONSE  = "c765a961-d9d8-4d36-a20a-5315b111836a"
+# Multiple input UUIDs from working implementations (probed in order)
+UUID_INPUT_REPORT_PRIMARY   = "7492866c-ec3e-4619-8258-32755ffcc0f9"  # macOS bridge (WORKING)
+UUID_INPUT_REPORT_SECONDARY = "ab7de9be-89fe-49ad-828f-118f09df7fd2"  # CareyScott/ndeadly research
+UUID_COMMAND_WRITE          = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
+UUID_COMMAND_RESPONSE       = "c765a961-d9d8-4d36-a20a-5315b111836a"
+UUID_SPRO2WIN_COMMAND       = "3dacbc7e-6955-40b5-8eaf-6f9809e8b379"  # SPro2Win command channel
+SPRO2WIN_INPUT_HANDLE       = 45  # SPro2Win fixed handle
 
-# ProCon2 init sequence (joycon2cpp-proven)
+# Input UUID probe order (tried in sequence, first found wins)
+INPUT_UUID_CANDIDATES = [
+    UUID_INPUT_REPORT_PRIMARY,
+    UUID_INPUT_REPORT_SECONDARY,
+]
+
+# ProCon2 init commands — optional, NOT used by working implementations
 PROCON2_INIT_FEATURE_02 = bytes.fromhex("0c 91 01 02 00 04 00 00 ff 00 00 00")
 PROCON2_INIT_FEATURE_04 = bytes.fromhex("0c 91 01 04 00 04 00 00 ff 00 00 00")
 PROCON2_LED_CMD         = bytes.fromhex("09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00")
 
-PROCON2_BUTTON_MASKS: Dict[str, int] = {
-    "a": 0x000800000000, "b": 0x000400000000, "x": 0x000200000000,
-    "y": 0x000100000000, "r": 0x004000000000, "l": 0x000000400000,
-    "zr": 0x008000000000, "zl": 0x000000800000, "home": 0x000010000000,
-    "back": 0x000001000000, "start": 0x000002000000, "r3": 0x000004000000,
-    "l3": 0x000008000000, "dpad_up": 0x000000020000, "dpad_right": 0x000000040000,
-    "dpad_down": 0x000000010000, "dpad_left": 0x000000080000,
-    "gl": 0x000000000200, "gr": 0x000000000100,
-    "screenshot": 0x000020000000, "c": 0x000040000000,
+# Button map: byte-level bitmasks from working implementations (SPro2Win + macOS bridge).
+# Byte 2 (right cluster): bits 0-7
+# Byte 3 (left cluster):  bits 0-7
+# Byte 4 (system/grip):  bits 0-7
+BUTTON_MAP: Dict[str, tuple] = {
+    # Byte 2 — right cluster (verified by SPro2Win + macOS bridge)
+    "b":     (2, 0x01), "a":  (2, 0x02), "y":  (2, 0x04), "x":  (2, 0x08),
+    "r":     (2, 0x10), "zr": (2, 0x20), "start": (2, 0x40), "r3": (2, 0x80),
+    # Byte 3 — left cluster
+    "dpad_down":  (3, 0x01), "dpad_right": (3, 0x02),
+    "dpad_left":  (3, 0x04), "dpad_up":    (3, 0x08),
+    "l":     (3, 0x10), "zl": (3, 0x20), "back": (3, 0x40), "l3": (3, 0x80),
+    # Byte 4 — system + grip
+    "home":       (4, 0x01),
+    "c":          (4, 0x02),  # SPro2Win: bit 1 = C button
+    "gr":         (4, 0x04),
+    "gl":         (4, 0x08),
+    "screenshot": (4, 0x10),
 }
 
 # Reconnect backoff parameters
@@ -170,38 +190,46 @@ def s16(data: bytes, offset: int) -> Optional[int]:
 
 
 def decode_report(data: bytes) -> Optional[Dict[str, Any]]:
-    """Decode a Switch 2 Pro Controller input report.
+    """Decode a Switch 2 Pro Controller input report using byte-level bitmasks.
 
-    Report format (≥0x3C bytes):
-      bytes 0-2:   packet ID (24-bit LE)
-      bytes 3-8:   buttons (48-bit BE bitfield)
-      bytes 10-12: left stick (12-bit packed X,Y)
-      bytes 13-15: right stick (12-bit packed X,Y)
-      bytes 0x30-0x35: accelerometer (3x s16 LE)
-      bytes 0x36-0x3B: gyroscope (3x s16 LE)
+    Report format (verified by SPro2Win + macOS bridge):
+      byte 0-1:   timer/counter (varies)
+      byte 2:     right cluster buttons (8 bits)
+      byte 3:     left cluster buttons (8 bits)
+      byte 4:     system + grip buttons (8 bits)
+      bytes 5-7:  left stick (12-bit packed X,Y)
+      bytes 8-10: right stick (12-bit packed X,Y)
+      bytes 11+:  accelerometer, gyro (optional, varies by report length)
+
+    Minimum valid report: 11 bytes (button data + sticks).
+    Longer reports (0x3C bytes) include accel/gyro at 0x30+.
     """
-    if len(data) < 0x3C:
+    if len(data) < 11:
         return None
 
-    # 48-bit button state from bytes 3..8 (big-endian)
-    state = 0
-    for i in range(3, 9):
-        state = (state << 8) | data[i]
+    # Byte-level button decoding
+    pressed = [
+        name for name, (byte_idx, mask) in BUTTON_MAP.items()
+        if len(data) > byte_idx and (data[byte_idx] & mask)
+    ]
 
-    pressed = [name for name, mask in PROCON2_BUTTON_MASKS.items() if state & mask]
+    # Sticks at bytes 5-10 (12-bit packed, same across all implementations)
+    left = decode_stick12(data, 5)
+    right = decode_stick12(data, 8)
 
-    left = decode_stick12(data, 10)
-    right = decode_stick12(data, 13)
-
-    return {
-        "packet_id": int.from_bytes(data[0:3], "little") if len(data) >= 3 else data[0],
-        "button_state": f"0x{state:012x}",
+    result: Dict[str, Any] = {
+        "packet_id": int.from_bytes(data[0:2], "little") if len(data) >= 2 else data[0],
         "pressed": pressed,
         "left_stick": left,
         "right_stick": right,
-        "accel": {"x": s16(data, 0x30), "y": s16(data, 0x32), "z": s16(data, 0x34)},
-        "gyro":  {"x": s16(data, 0x36), "y": s16(data, 0x38), "z": s16(data, 0x3A)},
     }
+
+    # Accel/gyro only available in long (0x3C-byte) reports
+    if len(data) >= 0x3C:
+        result["accel"] = {"x": s16(data, 0x30), "y": s16(data, 0x32), "z": s16(data, 0x34)}
+        result["gyro"] = {"x": s16(data, 0x36), "y": s16(data, 0x38), "z": s16(data, 0x3A)}
+
+    return result
 
 
 # ── Command Building ───────────────────────────────────────────
@@ -235,6 +263,7 @@ class DaemonState:
     device: Optional[BLEDevice] = None
     cmd_write_handle: Optional[int] = None
     input_report_handle: Optional[int] = None
+    input_report_uuid: Optional[str] = None  # which UUID was matched
 
     # Runtime stats
     report_count: int = 0
@@ -330,11 +359,19 @@ async def stage_scan(state: DaemonState) -> bool:
         if address_filter and device.address.upper() != address_filter.upper():
             return
 
+        # Match both manufacturer IDs: 0x0553 (Cypress chip) and 0x057E (Nintendo BT SIG)
         mfg_data = adv.manufacturer_data.get(NINTENDO_MFR_ID)
-        if not mfg_data:
+        nintendo_vid_data = adv.manufacturer_data.get(NINTENDO_VID)
+
+        if not mfg_data and not nintendo_vid_data:
             return
 
-        info = parse_manufacturer_data(mfg_data)
+        # macOS bridge approach: check for PID bytes in Nintendo manufacturer data
+        if nintendo_vid_data and PRO_CONTROLLER2_PID_LE not in nintendo_vid_data:
+            if not mfg_data:  # Nintendo VID but wrong PID → skip
+                return
+
+        info = parse_manufacturer_data(mfg_data if mfg_data else nintendo_vid_data)
         vid = info.get("vendor_id")
         pid = info.get("product_id")
 
@@ -423,6 +460,7 @@ async def stage_discover(state: DaemonState) -> bool:
 
     state.cmd_write_handle = None
     state.input_report_handle = None
+    state.input_report_uuid = None  # which UUID we matched
     service_count = 0
     char_count = 0
 
@@ -436,22 +474,29 @@ async def stage_discover(state: DaemonState) -> bool:
             if state.args.verbose:
                 state.log.info(f"  char {uuid_str[:36]} [{props}] handle={char.handle}")
 
-            if uuid_str == UUID_INPUT_REPORT.lower():
-                state.input_report_handle = char.handle
-                state.log.info(f"  → input report: handle={char.handle} props={props}")
-            elif uuid_str == UUID_COMMAND_WRITE.lower():
+            # Probe input UUIDs in priority order (first match wins)
+            if not state.input_report_handle:
+                for candidate_uuid in INPUT_UUID_CANDIDATES:
+                    if uuid_str == candidate_uuid.lower():
+                        state.input_report_handle = char.handle
+                        state.input_report_uuid = candidate_uuid
+                        state.log.info(f"  → input report: handle={char.handle} uuid={candidate_uuid[:36]} props={props}")
+                        break
+
+            if uuid_str == UUID_COMMAND_WRITE.lower():
                 state.cmd_write_handle = char.handle
                 state.log.info(f"  → command write: handle={char.handle} props={props}")
 
     if not state.input_report_handle:
         state.log.stage("discover", "fail",
-                        reason=f"input report UUID {UUID_INPUT_REPORT} not found",
+                        reason=f"no input report UUID found (tried: {INPUT_UUID_CANDIDATES})",
                         services=service_count, chars=char_count)
         return False
 
-    if not state.cmd_write_handle and state.args.mode != "none":
+    # Command write only needed if --init flag is set
+    if state.args.init and not state.cmd_write_handle:
         state.log.stage("discover", "fail",
-                        reason=f"command write UUID {UUID_COMMAND_WRITE} not found",
+                        reason=f"command write UUID {UUID_COMMAND_WRITE} not found (needed for --init)",
                         services=service_count, chars=char_count)
         return False
 
@@ -465,7 +510,11 @@ async def stage_discover(state: DaemonState) -> bool:
 # ── Stage: Init ────────────────────────────────────────────────
 
 async def stage_init(state: DaemonState) -> bool:
-    """Send ProCon2 init sequence (joycon2cpp-proven)."""
+    """Send ProCon2 init sequence — only if --init flag is set."""
+    if not state.args.init:
+        state.log.stage("init", "ok", skipped="init off by default (working impls skip it)")
+        return True
+
     if state.args.mode == "none":
         state.log.stage("init", "ok", skipped="mode=none")
         return True
@@ -500,17 +549,22 @@ async def stage_init(state: DaemonState) -> bool:
 async def stage_subscribe(state: DaemonState) -> bool:
     """Subscribe to input report notifications."""
     state.log.stage("subscribe", "start")
+    matched_uuid = state.input_report_uuid or UUID_INPUT_REPORT_PRIMARY
 
     def report_handler(sender, data: bytearray):
         handle_report(state, bytes(data), getattr(sender, "handle", None))
 
+    # SPro2Win mode: subscribe to ALL notify chars, filter by handle
+    if state.args.spro2win:
+        return await _subscribe_all_notify(state, report_handler)
+
     max_attempts = state.args.gatt_retries
     for attempt in range(1, max_attempts + 1):
         try:
-            await state.client.start_notify(UUID_INPUT_REPORT, report_handler)
+            await state.client.start_notify(matched_uuid, report_handler)
             state.log.stage("subscribe", "ok",
                            handle=state.input_report_handle,
-                           uuid=UUID_INPUT_REPORT)
+                           uuid=matched_uuid)
             return True
         except Exception as e:
             state.log.warn(f"subscribe failed ({attempt}/{max_attempts}): {e}")
@@ -521,10 +575,35 @@ async def stage_subscribe(state: DaemonState) -> bool:
     return False
 
 
+async def _subscribe_all_notify(state: DaemonState, handler) -> bool:
+    """SPro2Win-style: subscribe to every notify characteristic, filter by handle."""
+    state.log.info("subscribe-all mode: subscribing to all notify characteristics")
+    count = 0
+    for svc in state.client.services:
+        for char in svc.characteristics:
+            if "notify" not in char.properties:
+                continue
+            try:
+                await state.client.start_notify(char, handler)
+                count += 1
+                state.log.info(f"  subscribed: {char.uuid} handle={char.handle}")
+            except Exception as e:
+                state.log.warn(f"  subscribe failed handle={char.handle}: {e}")
+    if count == 0:
+        state.log.stage("subscribe", "fail", reason="no notify characteristics found")
+        return False
+    state.log.stage("subscribe", "ok", mode="subscribe-all", count=count)
+    return True
+
+
 # ── Report Handling ────────────────────────────────────────────
 
 def handle_report(state: DaemonState, data: bytes, handle: Optional[int] = None) -> None:
     """Process an incoming input report."""
+    # SPro2Win mode: filter by fixed handle 45
+    if state.args.spro2win and handle is not None and handle != SPRO2WIN_INPUT_HANDLE:
+        return
+
     state.report_count += 1
     state.total_reports += 1
     state.notify_event.set()
@@ -794,8 +873,12 @@ Examples:
     # GATT
     p.add_argument("--gatt-retries", type=int, default=10,
                    help="GATT service discovery retries (default: 10)")
-    p.add_argument("--mode", choices=("procon2", "none"), default="procon2",
-                   help="Init mode: procon2=joycon2cpp init, none=skip init (default: procon2)")
+    p.add_argument("--mode", choices=("procon2", "none"), default="none",
+                   help="Init mode: procon2=joycon2cpp init, none=skip (default: none)")
+    p.add_argument("--init", action="store_true", default=False,
+                   help="Send ProCon2 init sequence (off by default — working impls skip it)")
+    p.add_argument("--spro2win", action="store_true", default=False,
+                   help="SPro2Win mode: subscribe-all-notify, handle 45 filter, no init")
     p.add_argument("--no-led", action="store_true", default=False,
                    help="Skip LED command in procon2 init")
     p.add_argument("--notify-timeout", type=float, default=30.0,
