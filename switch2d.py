@@ -288,6 +288,13 @@ class DaemonState:
     last_report_hex: Optional[str] = None
     jsonl_file: Any = None
 
+    # Stage result flags — survive cleanup_client(), used for diagnostic summary
+    stage_scan_ok: bool = False
+    stage_connect_ok: bool = False
+    stage_discover_ok: bool = False
+    stage_subscribe_ok: bool = False
+    stage_reports_ok: bool = False
+
     # uinput
     uinput: Any = None
 
@@ -391,8 +398,9 @@ async def stage_scan(state: DaemonState) -> bool:
         vid = info.get("vendor_id")
         pid = info.get("product_id")
 
-        # Strict mode: only accept Pro Controller 2 (PID 0x2069)
-        if strict_pid and pid is not None and pid != PRO_CONTROLLER2_PID:
+        # Strict mode: only accept exactly Pro Controller 2 (PID 0x2069)
+        # pid=None (unparseable mfg data) is also rejected unless --loose-scan
+        if strict_pid and pid != PRO_CONTROLLER2_PID:
             if state.args.verbose:
                 state.log.info(f"  skip {device.address} pid=0x{pid:04x} (not Pro Controller 2)")
             return
@@ -419,6 +427,7 @@ async def stage_scan(state: DaemonState) -> bool:
         return False
 
     state.device = found_device
+    state.stage_scan_ok = True
     state.log.stage("scan", "ok", address=found_device.address,
                     vid=f"0x{found_info.get('vendor_id', 0):04x}",
                     pid=f"0x{found_info.get('product_id', 0):04x}")
@@ -446,6 +455,7 @@ async def stage_connect(state: DaemonState) -> bool:
         try:
             await asyncio.wait_for(client.connect(), timeout=20.0)
             state.client = client
+            state.stage_connect_ok = True
             state.log.stage("connect", "ok", mtu=client.mtu_size,
                            address=state.device.address)
             return True
@@ -531,6 +541,7 @@ async def stage_discover(state: DaemonState) -> bool:
                         services=service_count, chars=char_count)
         return False
 
+    state.stage_discover_ok = True
     state.log.stage("discover", "ok",
                     services=service_count, chars=char_count,
                     input_handle=state.input_report_handle,
@@ -593,6 +604,7 @@ async def stage_subscribe(state: DaemonState) -> bool:
     for attempt in range(1, max_attempts + 1):
         try:
             await state.client.start_notify(matched_uuid, report_handler)
+            state.stage_subscribe_ok = True
             state.log.stage("subscribe", "ok",
                            handle=state.input_report_handle,
                            uuid=matched_uuid)
@@ -623,6 +635,7 @@ async def _subscribe_all_notify(state: DaemonState, handler) -> bool:
     if count == 0:
         state.log.stage("subscribe", "fail", reason="no notify characteristics found")
         return False
+    state.stage_subscribe_ok = True
     state.log.stage("subscribe", "ok", mode="subscribe-all", count=count)
     return True
 
@@ -638,6 +651,7 @@ def handle_report(state: DaemonState, data: bytes, handle: Optional[int] = None)
     state.report_count += 1
     state.total_reports += 1
     state.notify_event.set()
+    state.stage_reports_ok = True
 
     # Track first/last report for diagnostic summary
     hex_str = data.hex()
@@ -854,13 +868,13 @@ async def diagnose_mode(state: DaemonState) -> int:
 
     session_ok = await run_session(state)
 
-    # Build diagnostic summary
+    # Build diagnostic summary from stage result flags — survive cleanup
     stages = {
-        "scan": state.device is not None,
-        "connect": state.client is not None and state.client.is_connected,
-        "discover": state.input_report_handle is not None,
-        "subscribe": True,  # reached only if subscribe succeeded
-        "reports": state.report_count > 0,
+        "scan": state.stage_scan_ok,
+        "connect": state.stage_connect_ok,
+        "discover": state.stage_discover_ok,
+        "subscribe": state.stage_subscribe_ok,
+        "reports": state.stage_reports_ok,
         "uinput": state.uinput is not None,
     }
     summary = {
