@@ -110,6 +110,49 @@ All profiles share:
 - **uinput gamepad**: 21 buttons + 6 axes when `--uinput` is set
 - **JSONL dump**: `--dump-jsonl` for hardware golden runs
 
+## ⚠️ Report Layout Warning
+
+The report layouts used by SPro2Win/macOS and joycon2cpp/Leon's Notes **may differ**.
+Until real JSONL reports are captured from actual hardware, the parser uses a unified
+layout that matches the SPro2Win + macOS bridge implementations (bytes 2-4 = buttons,
+bytes 5-10 = sticks).
+
+**Leon's Notes + joycon2cpp report layout** (from reverse engineering):
+- Minimum length: `0x3c` (60 bytes)
+- Button state: bytes 3-8 as a 48-bit big-endian bitfield
+- Left stick: bytes 10-12, 12-bit packed X/Y
+- Right stick: bytes 13-15, 12-bit packed X/Y
+- Accel: 0x30-0x35, Gyro: 0x36-0x3b
+
+**SPro2Win/macOS report layout** (current parser):
+- Minimum length: 11 bytes
+- Buttons: bytes 2-4 as bitmasks
+- Sticks: bytes 5-10 as 12-bit packed pairs
+
+These layouts disagree on button offset (byte 2 vs byte 3) and stick offset
+(byte 5 vs byte 10). The parser must **not** be changed until real hardware
+JSONL records are captured so the actual report format can be verified.
+
+## Future Profile: `joycon2cpp-pair`
+
+A pairing-aware profile is planned but **not yet enabled**. When implemented,
+it would add the Nintendo 0x15 COMMAND_PAIR GATT sequence before init writes:
+
+1. `SUBCOMMAND_PAIR_SET_MAC` (0x01) — send host MAC
+2. `SUBCOMMAND_PAIR_LTK1` (0x04) — hardcoded LTK value
+3. `SUBCOMMAND_PAIR_LTK2` (0x02) — hardcoded LTK value
+4. `SUBCOMMAND_PAIR_FINISH` (0x03) — finalize pairing
+
+The profile would wait for responses on `COMMAND_RESPONSE_UUID`
+(`c765a961-d9d8-4d36-a20a-5315b111836a`) between each step.
+
+**⚠️ WARNING — Do not enable by default:** The hardcoded LTK values in the
+reference implementations (Nadeflore/switch2-controllers, CareyScott/switch2controllerpc)
+are **donor/session-specific** — extracted from an already-paired real Switch 2
+Pro Controller's SPI flash. These values may not work for other controllers or
+pairing sessions. Without a donor controller, LTK generation is not possible.
+See `SMP_RESEARCH.md` for full context.
+
 ## References
 
 | Project | Platform | Status | Profile |

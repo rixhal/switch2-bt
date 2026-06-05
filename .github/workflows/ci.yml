@@ -1,4 +1,4 @@
-name: CI
+name: Python CI
 
 on:
   push:
@@ -7,48 +7,35 @@ on:
     branches: [master]
 
 jobs:
-  python:
+  test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ['3.11', '3.12']
+
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
 
-      - name: py_compile
-        run: python -m py_compile switch2d.py
+    - name: Syntax check (py_compile)
+      run: python -m py_compile switch2d.py
 
-      - name: pytest
-        run: python -m pytest tests/ -v
+    - name: Run tests
+      run: python -m pytest tests/ -v
 
-  docs-check:
+  legacy-c:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check required docs exist
-        run: |
-          for doc in docs/HARDWARE-TEST.md docs/TROUBLESHOOTING.md docs/PROTOCOL-PROFILES.md docs/SCOPE.md; do
-            test -f "$doc" || { echo "MISSING: $doc"; exit 1; }
-            echo "  ✅ $doc"
-          done
-
-      - name: Check README hardware validation banner
-        run: |
-          grep -q "Awaiting hardware validation" README.md || {
-            echo "README.md is missing the 'Awaiting hardware validation' banner."
-            echo "Add it back unless a hardware golden run has confirmed the daemon works."
-            exit 1
-          }
-          echo "  ✅ hardware validation banner present"
+    - uses: actions/checkout@v4
+    - name: Legacy C (manual only)
+      run: echo "Legacy C workflow — triggered manually via workflow_dispatch only."

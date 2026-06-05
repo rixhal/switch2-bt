@@ -130,6 +130,9 @@ NINTENDO_VID           = 0x057E
 PRO_CONTROLLER2_PID    = 0x2069
 PRO_CONTROLLER2_PID_LE = b'\x69\x20'  # 0x2069 little-endian, for scan matching
 
+# Known GATT UUIDs (from reverse engineering — SMP_RESEARCH.md)
+COMMAND_RESPONSE_UUID = "c765a961-d9d8-4d36-a20a-5315b111836a"
+
 # Button map: byte-level bitmasks from working implementations (SPro2Win + macOS bridge).
 # Byte 2 (right cluster): bits 0-7
 # Byte 3 (left cluster):  bits 0-7
@@ -298,13 +301,83 @@ def build_command(cmd_id: int, sub_id: int, data: bytes = b"") -> bytes:
 
 
 def parse_manufacturer_data(mfg_data: bytes) -> Dict[str, Any]:
-    """Parse manufacturer data into vendor_id, product_id, reconnect_mac."""
-    result: Dict[str, Any] = {"vendor_id": None, "product_id": None, "reconnect_mac": None}
+    """Parse manufacturer data into vendor_id, product_id, reconnect_mac.
+
+    Nintendo Switch 2 advertising format (from Leon's Notes + SMP_RESEARCH.md):
+      [0:1]   unknown
+      [1:3]   unknown
+      [3:5]   vendor_id (0x057E)
+      [5:7]   product_id (0x2069 = Pro Controller 2)
+      [7:10]  unknown
+      [10:16] reconnect_mac (6 bytes)
+                - 00:00:00:00:00:00 = pairing mode (sync button pressed)
+                - matches host MAC = already paired → skip pairing
+                - other nonzero = paired to different host
+    """
+    result: Dict[str, Any] = {
+        "vendor_id": None,
+        "product_id": None,
+        "reconnect_mac": None,
+        "pairing_mode": None,
+        "paired_to_host": None,
+        "paired_to_other_host": None,
+    }
     if len(mfg_data) >= 16:
         result["vendor_id"] = int.from_bytes(mfg_data[3:5], "little")
         result["product_id"] = int.from_bytes(mfg_data[5:7], "little")
         result["reconnect_mac"] = mfg_data[10:16]
+    if result["reconnect_mac"] is not None:
+        info = parse_reconnect_mac(result["reconnect_mac"])
+        result["pairing_mode"] = info["pairing_mode"]
+        result["paired_to_host"] = info["paired_to_host"]
+        result["paired_to_other_host"] = info["paired_to_other_host"]
     return result
+
+
+def parse_reconnect_mac(reconnect_mac: bytes, host_mac: Optional[str] = None) -> Dict[str, Any]:
+    """Derive pairing status from reconnect_mac field.
+
+    Returns:
+        pairing_mode: True if reconnect_mac is all zeros (sync button pressed).
+        paired_to_host: True if reconnect_mac matches host_mac, None if host_mac unknown/unparseable.
+        paired_to_other_host: True if reconnect_mac is nonzero and does not match host_mac,
+                              None if host_mac unknown/unparseable.
+    """
+    zero_mac = b'\x00\x00\x00\x00\x00\x00'
+    is_zero = reconnect_mac == zero_mac
+
+    matches_host = False
+    host_parseable = False
+    if host_mac and not is_zero:
+        try:
+            # Strip common MAC separators: colons, dashes, dots
+            cleaned = host_mac.replace(':', '').replace('-', '').replace('.', '')
+            host_bytes = bytes.fromhex(cleaned)
+            host_parseable = True
+            matches_host = reconnect_mac == host_bytes
+        except (ValueError, TypeError):
+            pass
+
+    if not host_mac:
+        # No host MAC known — can't determine pairing target
+        return {
+            "pairing_mode": is_zero,
+            "paired_to_host": None,
+            "paired_to_other_host": None,
+        }
+    elif not host_parseable:
+        # Host MAC provided but unparseable — treat as unknown
+        return {
+            "pairing_mode": is_zero,
+            "paired_to_host": None,
+            "paired_to_other_host": None,
+        }
+    else:
+        return {
+            "pairing_mode": is_zero,
+            "paired_to_host": matches_host,
+            "paired_to_other_host": not is_zero and not matches_host,
+        }
 
 
 # ── Daemon Core ────────────────────────────────────────────────
@@ -317,8 +390,16 @@ class DaemonState:
     client: Optional[BleakClient] = None
     device: Optional[BLEDevice] = None
     cmd_write_handle: Optional[int] = None
+    command_response_handle: Optional[int] = None  # c765a961 (future pairing profile)
     input_report_handle: Optional[int] = None
     input_report_uuid: Optional[str] = None
+
+    # Advertising diagnostics (from manufacturer data)
+    reconnect_mac: Optional[str] = None       # hex string from manufacturer data
+    reconnect_mac_raw: Optional[bytes] = None # raw 6 bytes
+    pairing_mode: Optional[bool] = None       # True if reconnect_mac == 00:00:00:00:00:00
+    paired_to_host: Optional[bool] = None     # True if reconnect_mac matches host adapter
+    paired_to_other_host: Optional[bool] = None
 
     # Active profile — always set before any stage function runs
     active_profile: ProtocolProfile = field(default_factory=lambda: PROFILE_MACOS)
@@ -364,6 +445,7 @@ class DaemonState:
         self.client = None
         self.report_count = 0
         self.cmd_write_handle = None
+        self.command_response_handle = None
         self.input_report_handle = None
         self.input_report_uuid = None
         self.disconnect_event.clear()
@@ -440,10 +522,23 @@ async def stage_scan(state: DaemonState) -> bool:
             found_device = device
             found_info = info
             found_event.set()
+        # Store advertising diagnostics in daemon state
+        if info.get("reconnect_mac"):
+            state.reconnect_mac_raw = info["reconnect_mac"]
+            state.reconnect_mac = state.reconnect_mac_raw.hex(':')  # type: ignore[union-attr]
+            state.pairing_mode = info["pairing_mode"]
+            state.paired_to_host = info["paired_to_host"]
+            state.paired_to_other_host = info["paired_to_other_host"]
+        pairing_label = (
+            "pairing_mode" if state.pairing_mode
+            else ("paired_to_host" if state.paired_to_host
+                   else ("paired_other" if state.paired_to_other_host else "paired_unknown"))
+        )
         state.log.info(
             f"found {device.address} rssi={adv.rssi} "
             f"vid=0x{info.get('vendor_id', 0):04x} pid=0x{pid:04x} "
-            f"reconnect_mac={info.get('reconnect_mac', b'').hex(':') if info.get('reconnect_mac') else '?'}"
+            f"reconnect_mac={state.reconnect_mac or '?'} "
+            f"({pairing_label})"
         )
 
     async with BleakScanner(callback):
@@ -460,7 +555,9 @@ async def stage_scan(state: DaemonState) -> bool:
     state.stage_scan_ok = True
     state.log.stage("scan", "ok", address=found_device.address,
                     vid=f"0x{found_info.get('vendor_id', 0):04x}",
-                    pid=f"0x{found_info.get('product_id', 0):04x}")
+                    pid=f"0x{found_info.get('product_id', 0):04x}",
+                    reconnect_mac=state.reconnect_mac or "?",
+                    pairing_mode=state.pairing_mode)
     return True
 
 
@@ -526,6 +623,7 @@ async def stage_discover(state: DaemonState) -> bool:
         return False
 
     state.cmd_write_handle = None
+    state.command_response_handle = None
     state.input_report_handle = None
     state.input_report_uuid = None
     service_count = 0
@@ -557,6 +655,11 @@ async def stage_discover(state: DaemonState) -> bool:
                 state.cmd_write_handle = char.handle
                 state.log.info(f"  → command write: handle={char.handle} props={props}")
 
+            # Log COMMAND_RESPONSE_UUID for future pairing profile diagnostics
+            if uuid_str == COMMAND_RESPONSE_UUID.lower():
+                state.command_response_handle = char.handle
+                state.log.info(f"  → command response: handle={char.handle} props={props} (future pairing)")
+
     if profile.subscribe_strategy == "selected" and not state.input_report_handle:
         state.log.stage("discover", "fail",
                         reason=f"no input UUID found (profile={profile.name}, tried={input_candidates})",
@@ -573,7 +676,8 @@ async def stage_discover(state: DaemonState) -> bool:
     state.log.stage("discover", "ok",
                     services=service_count, chars=char_count,
                     input_handle=state.input_report_handle,
-                    cmd_handle=state.cmd_write_handle)
+                    cmd_handle=state.cmd_write_handle,
+                    cmd_response_handle=state.command_response_handle)
     return True
 
 
@@ -968,6 +1072,12 @@ async def auto_detect_mode(state: DaemonState) -> int:
         "device": state.device.address if state.device else None,
         "input_uuid": state.input_report_uuid,
         "input_handle": state.input_report_handle,
+        "command_response_handle": state.command_response_handle,
+        "command_response_uuid": COMMAND_RESPONSE_UUID,
+        "reconnect_mac": state.reconnect_mac or None,
+        "pairing_mode": state.pairing_mode,
+        "paired_to_host": state.paired_to_host,
+        "paired_to_other_host": state.paired_to_other_host,
         "report_count": state.report_count if winner else 0,
         "first_report_hex": state.first_report_hex,
         "last_report_hex": state.last_report_hex,
@@ -1024,6 +1134,12 @@ async def diagnose_mode(state: DaemonState) -> int:
         "device": state.device.address if state.device else None,
         "input_uuid": state.input_report_uuid,
         "input_handle": state.input_report_handle,
+        "command_response_handle": state.command_response_handle,
+        "command_response_uuid": COMMAND_RESPONSE_UUID,
+        "reconnect_mac": state.reconnect_mac or None,
+        "pairing_mode": state.pairing_mode,
+        "paired_to_host": state.paired_to_host,
+        "paired_to_other_host": state.paired_to_other_host,
         "report_count": state.report_count,
         "first_report_hex": state.first_report_hex,
         "last_report_hex": state.last_report_hex,
