@@ -1,23 +1,19 @@
 # Switch 2 Pro Controller — Linux Wireless Daemon
 
-> ⚠️ **STATUS: NOT WORKING (Wireless BLE)** — June 2026  
-> USB kernel driver works. Wireless BLE connection **does not** work yet on
-> Linux. The Cypress CYW43455 chip on Raspberry Pi blocks raw HCI `LE Create
-> Connection`. BlueZ MGMT layer filters zero-byte scan responses. BTstack
-> bypasses both but the controller rejects standard BLE SMP pairing.
->
-> **[joycon2cpp](https://github.com/TheFrano/joycon2cpp)** (TheFrano) works on
-> Windows — we're porting that CareyScott GATT protocol to Linux. This is now
-> the **primary development path**.
->
-> See [RESEARCH.md](RESEARCH.md) for the full timeline (14 phases) of dead ends
-> and breakthroughs.
+> **STATUS: BlueZ/bleak daemon ready for hardware testing** — June 2026
+
+**`switch2d.py`** is a production BlueZ/bleak/uinput daemon for the Nintendo
+Switch 2 Pro Controller (VID 0x057E, PID 0x2069). It scans, connects via the
+Linux BLE stack, runs the joycon2cpp ProCon2 init sequence, subscribes to
+input report notifications, and exposes them as a standard Linux gamepad via
+`/dev/uinput`.
+
+[joycon2cpp](https://github.com/TheFrano/joycon2cpp) (TheFrano) is the
+reference Windows implementation. We port its CareyScott GATT protocol to
+Linux. Predecessor paths (raw HCI, BTstack, BlueZ D-Bus) are documented in
+[RESEARCH.md](RESEARCH.md) — 14 phases of dead ends and breakthroughs.
 
 ## Primary Path: `switch2d.py` — BlueZ/bleak → uinput
-
-Let the Linux BLE stack handle the connection (just like joycon2cpp does on
-Windows), then run the CareyScott GATT init sequence and pipe input reports
-to `/dev/uinput` as a standard gamepad.
 
 ```
 Controller (SYNC btn) ──BLE──► BlueZ (bluetoothd) ──► bleak (Python) ──► uinput
@@ -27,86 +23,83 @@ Controller (SYNC btn) ──BLE──► BlueZ (bluetoothd) ──► bleak (Pyt
 ### Quick Start
 
 ```bash
-# Install deps
-pip install bleak evdev
+# Install
+./install.sh
 
-# Hold controller SYNC button (top edge, recessed) until LEDs blink
-sudo python3 switch2d.py --mode procon2 --uinput --verbose
+# Diagnostic mode — verify everything works
+sudo python3 switch2d.py --diagnose --verbose
+
+# Daemon mode — run forever with auto-reconnect
+sudo python3 switch2d.py --daemon --uinput --max-reports 0 --verbose
 ```
 
-### What It Does
+### Modes
 
-1. **Scan** for Nintendo manufacturer ID `0x0553` + VID `0x057E` + PID `0x2069`
-2. **Connect** via BlueZ/bleak (no raw HCI — uses kernel mgmt path CYW43455 allows)
-3. **Discover** GATT services → find input notify UUID and command write UUID
-4. **Init** — 2-step joycon2cpp feature-select writes (WriteWithoutResponse):
-   ```
-   0c 91 01 02 00 04 00 00 ff 00 00 00    (200ms gap)
-   0c 91 01 04 00 04 00 00 ff 00 00 00
-   ```
-5. **Subscribe** to input report notifications
-6. **Decode** ProCon2 0x3C-byte reports → 21 buttons + 4 analog axes
-7. **Expose** via `/dev/uinput` as standard Linux gamepad
+| Flag | Behavior |
+|------|----------|
+| `--diagnose` | Run full connect→discover→init→subscribe cycle, verify reports, exit |
+| `--daemon` | Run forever with exponential-backoff reconnect |
+| (default) | Single session, exit after first connection |
 
-### Key GATT UUIDs (CareyScott / joycon2cpp)
+### Stage Pipeline
 
-| Function | UUID |
-|----------|------|
-| Input Report (notify) | `ab7de9be-89fe-49ad-828f-118f09df7fd2` |
-| Command Write | `649d4ac9-8eb7-4e6c-af44-1ea54fe5f005` |
-| Command Response | `c765a961-d9d8-4d36-a20a-5315b111836a` |
+```
+PREFLIGHT → SCAN → CONNECT → DISCOVER → INIT → SUBSCRIBE → RUNNING
+```
 
-### Report Format (0x3C bytes, Pro Controller 2)
+Each stage logs structured results (text or `--json` for machine parsing).
+Exit codes 10-16 map to the failing stage.
+
+### Report Format (0x3C bytes)
 
 | Field | Offset |
 |-------|--------|
-| Buttons (48-bit BE) | bytes 3..8 |
-| Left stick (12-bit X/Y) | bytes 10..12 |
-| Right stick (12-bit X/Y) | bytes 13..15 |
-| Accel | bytes 0x30..0x35 |
-| Gyro | bytes 0x36..0x3b |
+| Packet ID (24-bit LE) | 0..2 |
+| Buttons (48-bit BE) | 3..8 |
+| Left stick (12-bit packed X,Y) | 10..12 |
+| Right stick (12-bit packed X,Y) | 13..15 |
+| Accel (3× s16 LE) | 0x30..0x35 |
+| Gyro (3× s16 LE) | 0x36..0x3B |
 
-### Hardware Run Checklist
+21 buttons: A, B, X, Y, L, R, ZL, ZR, Home, Minus, Plus, L3, R3, D-Pad,
+Screenshot, C, GL, GR
 
-When testing on hardware, collect these log milestones:
+### Flags
 
-- [ ] **Scan:** Found Nintendo controller? BD_ADDR + manufacturer data decoded?
-- [ ] **Connect:** BLE connection successful? Handle?
-- [ ] **Services:** GATT services discovered? Count?
-- [ ] **Command UUID:** `649d4ac9-...` found? Handle?
-- [ ] **Notify UUID:** `ab7de9be-...` found? Handle?
-- [ ] **Init write:** Both feature-select commands acknowledged?
-- [ ] **Subscribe:** CCCD notification enabled?
-- [ ] **Reports:** Input reports received? Count? Hexdump first 3?
+```
+--diagnose            Diagnostic mode: verify everything, then exit
+--daemon              Daemon mode: run forever with reconnect
+--max-reports N       0 = unlimited (default: 100)
+--scan-timeout S      BLE scan timeout (default: 10s)
+--address BDADDR      Filter scan to specific address
+--mode procon2|none   Init mode (default: procon2)
+--uinput              Create /dev/uinput gamepad
+--verbose             Detailed output
+--json                JSON-line structured logging
+--quiet               Errors only
+```
 
-Log each step. If anything fails, capture the exact error and surrounding context.
+### Systemd
+
+```bash
+sudo ./install.sh --systemd
+systemctl status switch2d
+journalctl -u switch2d -f
+```
 
 ---
 
-## Alternative Paths
+## Docs
 
-### BTstack Bridge (`switch2_btstack_bridge.c`)
+- [HARDWARE-TEST.md](docs/HARDWARE-TEST.md) — Step-by-step hardware validation checklist
+- [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — Symptom→Diagnosis→Fix guide
+- [RESEARCH.md](RESEARCH.md) — Full timeline of 14 research phases
 
-Bypasses BlueZ entirely via `HCI_CHANNEL_USER`. BTstack handles the BLE
-connection and GATT client internally. Works around the CYW43455 `Command
-Disallowed` blocking but hits the SMP pairing wall (error 0x13).
-
-```bash
-# Build
-cd btstack-upstream/port/linux/build && cmake .. && make switch2_btstack_bridge
-
-# Run (must stop BlueZ first!)
-systemctl stop bluetooth && hciconfig hci0 down
-sudo ./switch2_btstack_bridge
-```
-
-### USB Kernel Driver (`hid-switch2.ko`)
-
-Working USB path — 21 buttons, 4 axes, force feedback. Deploy to LibreELEC:
+## Tests
 
 ```bash
-scp *.ko root@crackbery5:/lib/modules/$(uname -r)/extra/
-ssh root@crackbery5 insmod /lib/modules/$(uname -r)/extra/hid-switch2.ko
+pip install -r requirements-dev.txt
+python3 -m pytest tests/ -v
 ```
 
 ---
@@ -114,50 +107,45 @@ ssh root@crackbery5 insmod /lib/modules/$(uname -r)/extra/hid-switch2.ko
 ## Repo Structure
 
 ```
-switch2d.py                  ← 🔥 PRIMARY: BlueZ/bleak → uinput daemon
-switch2-bt.c                 ← BlueZ D-Bus GATT daemon (needs rewrite)
-switch2-bt-ff.c              ← Force feedback kernel module
-switch2_btstack_bridge.c     ← BTstack no-SMP GATT bridge
+switch2d.py                  ← PRIMARY: BlueZ/bleak → uinput daemon
 src/
-  switch2_protocol.c/.h      ← CareyScott protocol: pair keys, command builder
+  switch2_protocol.c/.h      ← CareyScott protocol (C reference)
 tests/
-  test_pair_payloads.py      ← 17 byte-accurate payload tests
-legacy/raw-hci/              ← Dead-end experiments (archived)
-  sw2d_final.c               ← libbluetooth + raw ACL (CYW43455 blocks)
-  sw2d.c                     ← raw socket attempt (no connection ownership)
-  dump_reports.py            ← JSONL report analyzer
-btstack-upstream/            ← BTstack fork (static lib, custom bridge)
-btstack_build/               ← BTstack build config + artifacts
+  test_parsing.py            ← Stick/report/manufacturer-data parsing
+  test_commands.py           ← Command builder payload verification
+  test_report_decode.py      ← Full report decode with known samples
+  test_pair_payloads.py      ← CareyScott pair payload byte-accuracy
+docs/
+  HARDWARE-TEST.md           ← Hardware validation checklist
+  TROUBLESHOOTING.md         ← Troubleshooting guide
+systemd/
+  switch2d.service           ← systemd unit file
+install.sh                   ← One-command installer
+requirements.txt             ← Python deps (bleak, evdev)
+requirements-dev.txt         ← Dev deps (pytest)
+legacy/raw-hci/              ← Raw HCI experiments (archived)
+btstack-upstream/            ← BTstack fork (static lib)
 ```
-
----
 
 ## Known Blockers
 
 | Blocker | Where | Symptom |
 |---------|-------|---------|
-| CYW43455 firmware | raw HCI | `LE Create Connection` → `Command Disallowed (0x0C)` |
-| BlueZ MGMT filter | bluetoothd | Zero-byte SCAN_RSP → device never registered |
-| SMP pairing rejected | BTstack | Controller terminates with `0x13` on any Pairing Request |
-| `switch2-bt.c` wrong protocol | BlueZ D-Bus daemon | Uses ndeadly UUIDs instead of CareyScott/joycon2cpp |
+| BlueZ MGMT filter | bluetoothd | Zero-byte SCAN_RSP → device may not register |
+| CYW43455 firmware | raw HCI only | `LE Create Connection` → `Command Disallowed` |
+| SMP pairing rejected | raw HCI/BTstack | Controller terminates on standard SMP |
+
+**The BlueZ/bleak path avoids CYW43455 and SMP blockers** by letting the kernel
+MGMT layer handle the connection. This is the same approach joycon2cpp uses on
+Windows.
 
 ## Credits
 
 - **[TheFrano/joycon2cpp](https://github.com/TheFrano/joycon2cpp)** — Windows wireless proof-of-concept
-  using CareyScott GATT protocol (Pro Controller 2 init sequence, report format, button masks)
-- **[CareyScott/switch2controllerpc](https://github.com/CareyScott/switch2controllerpc)** — GATT pairing
-  protocol reverse-engineering (SetMAC, LTK1/LTK2/Finish, UUID discovery)
-- **[bluekitchen/btstack](https://github.com/bluekitchen/btstack)** — Bluetooth Host stack used for
-  HCI_CHANNEL_USER bypass on CYW43455 (port/linux)
-- **SDL2** — `SDL_hidapi_switch2.c` for USB subcommand discovery
-- **[Nohzockt/BlueRetro](https://github.com/Nohzockt/Switch2-Controllers)** — Switch 2 Pro Controller
-  research, GATT UUIDs, init sequence (v1.8 release)
-- **[ndeadly/MissionControl](https://github.com/ndeadly/MissionControl)** — Switch controller GATT
-  research, UUIDs, button mapping, report format
-- **BlueZ** — `hcilecreateconn` test program validated libbluetooth connection approach
-- **[Akashem06/RPI_Bluetooth](https://github.com/Akashem06/RPI_Bluetooth)** — Raw-HCI host layer on RPi4
-- **[bleno#225](https://github.com/noble/bleno/issues/225)** — HCI_CHANNEL_USER usage pattern on Linux
-- **Claude** — Architectural review, code audit, root cause analysis of SMP error 0x13
-- **Codex** — Initial sw2d.c and sw2d_final.c implementations
+- **[CareyScott/switch2controllerpc](https://github.com/CareyScott/switch2controllerpc)** — GATT pairing reverse-engineering
+- **[bluekitchen/btstack](https://github.com/bluekitchen/btstack)** — HCI_CHANNEL_USER bypass reference
+- **SDL2** — USB subcommand discovery (`SDL_hidapi_switch2.c`)
+- **[Nohzockt/BlueRetro](https://github.com/Nohzockt/Switch2-Controllers)** — Switch 2 controller research
+- **[ndeadly/MissionControl](https://github.com/ndeadly/MissionControl)** — Switch controller GATT research
 
 Built on crackberry (Raspberry Pi 4) for crackbery5 (Raspberry Pi 5 / LibreELEC).

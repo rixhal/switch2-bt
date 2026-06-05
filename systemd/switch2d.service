@@ -1,0 +1,15 @@
+[Unit]
+Description=Nintendo Switch 2 Pro Controller BLE Daemon
+After=bluetooth.target
+Requires=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/switch2d/switch2d.py --daemon --uinput --max-reports 0 --verbose
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
