@@ -101,13 +101,15 @@ PROFILE_JOYCON2CPP = ProtocolProfile(
     input_uuids=["ab7de9be-89fe-49ad-828f-118f09df7fd2"],
     command_uuid="649d4ac9-8eb7-4e6c-af44-1ea54fe5f005",
     init_commands=[
+        # joycon2cpp timing: 0x02 → 500ms → 0x04 → 500ms → 200ms barrier → LED → 50ms → Sound → 50ms
         ("feature-select 0x02", bytes.fromhex("0c 91 01 02 00 04 00 00 ff 00 00 00"), 0.5),
-        ("feature-select 0x04", bytes.fromhex("0c 91 01 04 00 04 00 00 ff 00 00 00"), 0.2),
+        ("feature-select 0x04", bytes.fromhex("0c 91 01 04 00 04 00 00 ff 00 00 00"), 0.7),  # 0.5s init + 0.2s barrier
         ("set LED", bytes.fromhex("09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00"), 0.05),
+        ("sound", bytes.fromhex("0a 91 01 02 00 08 00 00 04 00 00 00 00 00 00 00"), 0.05),
     ],
     subscribe_strategy="selected",
     spro2win_handle=None,
-    description="Init writes + selected notify on ab7de9be. Full ProCon2 init sequence.",
+    description="Init writes + LED + Sound + selected notify on ab7de9be. Full joycon2cpp init sequence.",
 )
 
 PROTOCOL_PROFILES: Dict[str, ProtocolProfile] = {
@@ -719,6 +721,11 @@ def update_uinput(state: DaemonState, decoded: Dict[str, Any]) -> None:
             "l3": e.BTN_THUMBL, "r3": e.BTN_THUMBR,
             "dpad_up": e.BTN_DPAD_UP, "dpad_down": e.BTN_DPAD_DOWN,
             "dpad_left": e.BTN_DPAD_LEFT, "dpad_right": e.BTN_DPAD_RIGHT,
+            # Switch 2 specific — mapped to BTN_TRIGGER_HAPPY (standard evdev extension)
+            "c": e.BTN_TRIGGER_HAPPY1,
+            "gl": e.BTN_TRIGGER_HAPPY2,
+            "gr": e.BTN_TRIGGER_HAPPY3,
+            "screenshot": e.BTN_TRIGGER_HAPPY4,
         }
         for btn_name, code in btn_map.items():
             state.uinput.write(e.EV_KEY, code, 1 if btn_name in pressed else 0)
@@ -753,6 +760,8 @@ def setup_uinput(state: DaemonState) -> bool:
             e.BTN_SELECT, e.BTN_START, e.BTN_MODE,
             e.BTN_THUMBL, e.BTN_THUMBR,
             e.BTN_DPAD_UP, e.BTN_DPAD_DOWN, e.BTN_DPAD_LEFT, e.BTN_DPAD_RIGHT,
+            e.BTN_TRIGGER_HAPPY1, e.BTN_TRIGGER_HAPPY2,
+            e.BTN_TRIGGER_HAPPY3, e.BTN_TRIGGER_HAPPY4,
         ]
         abs_axis = AbsInfo(value=0, min=-32768, max=32767, fuzz=16, flat=128, resolution=0)
         trigger_axis = AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)

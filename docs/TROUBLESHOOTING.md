@@ -111,9 +111,9 @@ bluetoothctl
 1. Remove stale bonds: `bluetoothctl remove <BDADDR>`
 2. Power-cycle controller: hold power button until off, then SYNC again.
 3. Increase GATT retries: `--gatt-retries 20`
-4. Try with `--mode none` first (skip init) to isolate whether discovery alone
-   works. If services appear with `--mode none` but not with `--mode procon2`,
-   the issue is post-connect controller state.
+4. Try with `--profile macos` first (skip init) to isolate whether discovery alone
+   works. If services appear with `--profile macos` but not with `--profile
+   joycon2cpp`, the issue is post-connect controller state.
 5. As a last resort, try the BTstack bridge (`switch2_btstack_bridge.c`) which
    handles GATT discovery differently (see README § "Alternative Paths").
 
@@ -141,7 +141,7 @@ bluetoothctl
 3. If input report UUID *is* found but command write is not, the controller
    may be in a read-only mode. Try USB-init (plug into USB briefly, unplug,
    SYNC again).
-4. Run with `--mode none` to verify discovery works without init — this at
+4. Run with `--profile macos` to verify discovery works without init — this at
    least confirms the BLE path is functional.
 
 ---
@@ -170,10 +170,11 @@ bluetoothctl
 ```
 
 **Fix:**
-1. Ensure init stage succeeded before subscribe. If init failed, fix init first.
+2. Ensure init stage succeeded before subscribe. If init failed, fix init first
+   (check `--profile joycon2cpp` — macos and spro2win profiles have no init).
 2. Increase GATT retries: `--gatt-retries 20`
-3. Try `--mode none` — if subscribe works without init, the init sequence may
-   be interfering. This is a diagnostic step, not a fix.
+3. Try `--profile macos` — if subscribe works without init, the init sequence
+   may be interfering. This is a diagnostic step, not a fix.
 4. If `bluetoothctl notify on` also fails, the controller's GATT server is
    rejecting notification setup — possible firmware/state issue.
 
@@ -209,8 +210,8 @@ bluetoothctl
 4. If reports flow on Windows (joycon2cpp) but not Linux, check:
    - BlueZ version: `bluetoothd --version` (5.64+ recommended)
    - Kernel version: `uname -r` (5.15+ recommended for BLE stability)
-   - Try with `--mode none` (skip init) — if reports appear, init sequence needs
-     adjustment.
+   - Try with `--profile macos` (skip init) — if reports appear, init sequence
+     needs adjustment.
 
 ---
 
@@ -353,7 +354,7 @@ After this, `switch2d.py --uinput` can run without `sudo`.
 | 11 | Scan | Hold SYNC button; `--scan-timeout 30`; try USB-init |
 | 12 | Connect | `systemctl status bluetooth`; verify address; use MGMT path |
 | 13 | Discover | Remove stale bonds; `--gatt-retries 20`; power-cycle controller |
-| 14 | Init | Verify PID 0x2069; try `--mode none` for diagnosis |
+| 14 | Init | Verify PID 0x2069; try `--profile macos` for diagnosis |
 | 15 | Subscribe/Reports | Press buttons; `--notify-timeout 60`; check CCCD |
 | 16 | Running/Disconnect | Keep controller awake; use `--daemon` for reconnect |
 
@@ -363,6 +364,7 @@ After this, `switch2d.py --uinput` can run without `sudo`.
 |------|---------|
 | `--diagnose` | One-shot full pipeline test with exit codes |
 | `--daemon` | Infinite reconnect loop |
+| `--profile auto\|macos\|spro2win\|joycon2cpp` | Protocol profile (auto = sequential fallback) |
 | `--uinput` | Create Linux gamepad device at `/dev/uinput` |
 | `--verbose` | Show all characteristics, reports, stick values |
 | `--json` | Structured JSON-line log output |
@@ -370,10 +372,9 @@ After this, `switch2d.py --uinput` can run without `sudo`.
 | `--scan-timeout <N>` | BLE scan duration (default: 10s) |
 | `--connect-retries <N>` | Connection attempts (default: 3) |
 | `--gatt-retries <N>` | GATT discovery retries (default: 10) |
-| `--mode procon2\|none` | Init mode: procon2=joycon2cpp init, none=skip |
-| `--no-led` | Skip LED command in init |
 | `--notify-timeout <N>` | Max seconds without reports (default: 30) |
 | `--max-reports <N>` | Max reports before exit (0=unlimited) |
+| `--loose-scan` | Accept any Nintendo device (not just ProCon2) |
 | `--quiet` | Minimal output |
 
 ---

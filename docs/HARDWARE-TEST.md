@@ -18,8 +18,8 @@ sudo python3 switch2d.py --diagnose --verbose
 # Daemon mode (reconnect loop, uinput gamepad)
 sudo python3 switch2d.py --daemon --uinput --max-reports 0 --verbose
 
-# Skip init (just scan & connect, read-only)
-sudo python3 switch2d.py --mode none --verbose
+# Read-only (skip init, just scan & connect)
+sudo python3 switch2d.py --profile macos --verbose
 ```
 
 ---
@@ -154,35 +154,38 @@ looking for the three CareyScott/joycon2cpp UUIDs.
 
 ## 5. INIT
 
-Send the 2-step ProCon2 feature-select sequence (joycon2cpp-proven) via
-WriteWithoutResponse on the command write characteristic. Optionally sends a
-LED command.
+Send the joycon2cpp-proven init sequence (feature-select 0x02 → 0x04 → LED →
+Sound) via WriteWithoutResponse on the command write characteristic.
 
 ### Checklist
 
 - [ ] Feature-select 0x02 acknowledged (no write error)
 - [ ] Feature-select 0x04 acknowledged
-- [ ] LED command sent (unless `--no-led`)
+- [ ] LED command sent (sets player 1)
+- [ ] Sound command sent (Nintendo connect sound)
 
-### Commands Sent
+### Commands Sent (joycon2cpp profile)
 
 ```
-0c 91 01 02 00 04 00 00 ff 00 00 00    # feature-select 0x02
-0c 91 01 04 00 04 00 00 ff 00 00 00    # feature-select 0x04
-09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00  # LED (optional)
+0c 91 01 02 00 04 00 00 ff 00 00 00    # feature-select 0x02 → 500ms
+0c 91 01 04 00 04 00 00 ff 00 00 00    # feature-select 0x04 → 700ms (500ms + 200ms barrier)
+09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00  # LED player 1 → 50ms
+0a 91 01 02 00 08 00 00 04 00 00 00 00 00 00 00  # Sound → 50ms
 ```
 
 ### Expected Output
 
 ```
-[0005.500] ▶ init mode=procon2
+[0005.500] ▶ init start profile=joycon2cpp
 [0005.501]   info msg=  → feature-select 0x02: 0c 91 01 02 00 04 00 00 ff 00 00 00
 [0005.550]   info msg=  ← feature-select 0x02: OK
-[0005.750]   info msg=  → feature-select 0x04: 0c 91 01 04 00 04 00 00 ff 00 00 00
-[0005.800]   info msg=  ← feature-select 0x04: OK
-[0005.850]   info msg=  → set LED: 09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00
-[0005.860]   info msg=  ← set LED: OK
-[0005.861] ✅ init
+[0006.050]   info msg=  → feature-select 0x04: 0c 91 01 04 00 04 00 00 ff 00 00 00
+[0006.750]   info msg=  ← feature-select 0x04: OK
+[0006.800]   info msg=  → set LED: 09 91 01 07 00 08 00 00 01 00 00 00 00 00 00 00
+[0006.810]   info msg=  ← set LED: OK
+[0006.860]   info msg=  → sound: 0a 91 01 02 00 08 00 00 04 00 00 00 00 00 00 00
+[0006.870]   info msg=  ← sound: OK
+[0006.871] ✅ init
 ```
 
 ### If This Fails
@@ -190,7 +193,7 @@ LED command.
 | Symptom | See TROUBLESHOOTING.md |
 |---------|------------------------|
 | Write fails with exception | *Command write characteristic not found* |
-| `skipped mode=none` | Use `--mode procon2` (default) |
+| `skipped profile=macos has no init` | Use `--profile joycon2cpp` for init |
 
 ---
 
