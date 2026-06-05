@@ -5,7 +5,7 @@ Requires=bluetooth.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/switch2d/switch2d.py --daemon --uinput --max-reports 0 --verbose
+ExecStart=/usr/bin/python3 /opt/switch2d/switch2d.py --daemon --profile auto --uinput --max-reports 0 --verbose
 Restart=always
 RestartSec=5
 User=root

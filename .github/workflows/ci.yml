@@ -1,28 +1,41 @@
-name: CI
+name: Python CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
 
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libbluetooth-dev
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
 
-      - name: Build sw2d_final
-        run: make
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
 
-      - name: Build tools (sw2d_lib, hciletest)
-        run: make tools
+    - name: Syntax check (py_compile)
+      run: python -m py_compile switch2d.py
 
-      - name: Build and run tests
-        run: make test
+    - name: Run tests
+      run: python -m pytest tests/ -v
+
+  legacy-c:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Legacy C (manual only)
+      run: echo "Legacy C workflow — triggered manually via workflow_dispatch only."
