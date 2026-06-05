@@ -27,6 +27,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.pytest_cache/
 
 # OS
 .DS_Store
