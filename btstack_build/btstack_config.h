@@ -1,0 +1,48 @@
+// btstack_config.h for sw2d_btstack — Switch 2 BLE HID Host on Raspberry Pi 5 (CYW43455)
+#ifndef BTSTACK_CONFIG_H
+#define BTSTACK_CONFIG_H
+
+// BTstack features
+#define ENABLE_CLASSIC
+#define ENABLE_BLE
+#define ENABLE_LE_CENTRAL
+#define ENABLE_LE_SECURE_CONNECTIONS
+#define ENABLE_GATT_CLIENT
+//#define ENABLE_GATT_CLIENT_PAIRING
+#define ENABLE_EXPLICIT_PAIRING_ON_SECURITY_REQUEST
+
+#define ENABLE_LOG_INFO
+#define ENABLE_LOG_ERROR
+#define ENABLE_PRINTF_HEXDUMP
+
+// Memory config
+#define HCI_ACL_PAYLOAD_SIZE 512
+#define MAX_NR_LE_DEVICE_DB_ENTRIES 4
+#define MAX_NR_HCI_CONNECTIONS 4
+#define MAX_NR_SM_LOOKUP_ENTRIES 3
+#define MAX_NR_WHITELIST_ENTRIES 1
+#define MAX_NR_GATT_CLIENTS 1
+
+// HCI buffers
+#define HCI_OUTGOING_PRE_BUFFER_SIZE 4
+#define HCI_INCOMING_PRE_BUFFER_SIZE 6
+
+// Controller flow control
+#define ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL
+#define HCI_HOST_ACL_PACKET_NUM 10
+#define HCI_HOST_ACL_PACKET_LEN 512
+#define HCI_HOST_SCO_PACKET_NUM 0
+#define HCI_HOST_SCO_PACKET_LEN 0
+
+// NVM (no persistent storage for now)
+#define NVM_NONE
+#define NVM_NUM_LINK_KEYS 0
+#define NVM_NUM_DEVICE_DB_ENTRIES 1
+
+// Mesh (required by BTstack even if unused)
+#define MAX_NR_MESH_VIRTUAL_ADDRESSES 0
+#define MAX_NR_MESH_SUBNETS            0
+#define MAX_NR_MESH_APPKEYS            0
+#define MAX_NR_MESH_MODELS             0
+
+#endif
