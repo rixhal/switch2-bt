@@ -135,3 +135,19 @@ d23e6f1 — docs: LE13/Widevine Root Cause Analyse (diese Datei)
 Datei: `LE13_WIDEVINE_RESEARCH.md`  
 Repository: rixhal/switch2-bt (GitHub) + git.richie.fyi/rixhal/switch2-raw (Forgejo)  
 Branch: feat/switch2d-production-daemon
+
+---
+
+## Finale Resolution (2026-06-11)
+
+**Aktion:** Downgrade auf LE12 per SD-Karten-Recovery.
+- `/flash/kernel.img` → 11.8 MB (LE12 6.12.56)
+- `/flash/SYSTEM` → 151 MB (LE12)
+- Boot Partition via ext4-Mount auf Hermes-Pi geschrieben (FAT32 dd war korrupt)
+- SD-Karte zurück in crackberry5 → bootet LE12 sauber
+
+**Status:**
+- Crunchyroll + Live-TV = ERWARTET funktionierend (LE12 GLES-Renderer)
+- Alle 5 Fixes bleiben deployed für zukünftiges LE13-Retest
+- pugixml.so.1, manifest_config={}, playercorefactory.xml, guisettings
+- Reset: `NOSECUREDECODER=true` (für LE13) kann auf LE12 auf false
