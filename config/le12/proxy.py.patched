@@ -1,0 +1,853 @@
+import base64
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+
+import xbmc
+
+from resources.lib import drive, epg, metadata, utils, vjlive
+
+
+_server = None
+_server_thread = None
+_session_lock = threading.Lock()
+_sessions = {}
+_SESSION_TTL = 900
+_bad_lock = threading.Lock()
+_bad_sources = {}
+_bad_hosts = {}
+_health_lock = threading.Lock()
+_health_cache = None
+_BAD_STREAM_TTL = 600
+_PROBE_TIMEOUT = 5
+_PROBE_BYTES = 262144
+_HEALTH_FILE = os.path.join(utils.STATE_DIR, "stream_health.json")
+_TRANSPARENT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+
+def _cleanup_sessions():
+    cutoff = time.time() - _SESSION_TTL
+    with _session_lock:
+        stale = [key for key, value in _sessions.items() if value["created"] < cutoff]
+        for key in stale:
+            _sessions.pop(key, None)
+
+
+def _min_probe_rate():
+    return max(64, utils.get_setting_int("min_probe_rate_kbps", 512)) * 1024
+
+
+def _target_probe_rate():
+    return max(_min_probe_rate(), utils.get_setting_int("target_probe_rate_kbps", 2048) * 1024)
+
+
+def _stream_cooldown_ttl():
+    return max(60, utils.get_setting_int("stream_cooldown_seconds", _BAD_STREAM_TTL))
+
+
+def _segment_retry_count():
+    return max(0, utils.get_setting_int("segment_retry_count", 1))
+
+
+def _segment_buffer_bytes():
+    return max(0, utils.get_setting_int("segment_buffer_mb", 24)) * 1024 * 1024
+
+
+def _segment_start_buffer_bytes():
+    return max(1, utils.get_setting_int("segment_start_buffer_mb", 2)) * 1024 * 1024
+
+
+def _segment_timeout():
+    return max(3, utils.get_setting_int("segment_timeout_seconds", 7))
+
+
+def _health_max_age():
+    return max(1, utils.get_setting_int("stream_health_hours", 72)) * 3600
+
+
+def _register_session(headers, source=""):
+    session_id = uuid.uuid4().hex
+    with _session_lock:
+        _sessions[session_id] = {"headers": headers or {}, "source": source or "", "created": time.time()}
+    return session_id
+
+
+def _get_session(session_id):
+    _cleanup_sessions()
+    with _session_lock:
+        return _sessions.get(session_id, {"headers": {}, "created": 0})
+
+
+def _drop_session(session_id):
+    with _session_lock:
+        _sessions.pop(session_id, None)
+
+
+def _cleanup_bad_streams():
+    now = time.time()
+    with _bad_lock:
+        for bucket in (_bad_sources, _bad_hosts):
+            stale = [key for key, value in bucket.items() if value["until"] <= now]
+            for key in stale:
+                bucket.pop(key, None)
+
+
+def _host_key(url):
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return ""
+    port = ":%d" % parsed.port if parsed.port else ""
+    return "%s%s" % (parsed.hostname.lower(), port)
+
+
+def _is_ip_literal(host):
+    if not host:
+        return False
+    return bool(re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", host))
+
+
+def _load_health():
+    global _health_cache
+    with _health_lock:
+        if _health_cache is not None:
+            return _health_cache
+        data = utils.read_json(_HEALTH_FILE, default={})
+        if not isinstance(data, dict):
+            data = {}
+        cutoff = time.time() - _health_max_age()
+        for bucket_name in ("sources", "hosts"):
+            bucket = data.setdefault(bucket_name, {})
+            stale = [key for key, value in bucket.items() if value.get("last_seen", 0) < cutoff]
+            for key in stale:
+                bucket.pop(key, None)
+        _health_cache = data
+        return _health_cache
+
+
+def _save_health(data):
+    with _health_lock:
+        utils.write_json(_HEALTH_FILE, data)
+
+
+def _health_entry(bucket_name, key):
+    if not key:
+        return {}
+    data = _load_health()
+    return data.setdefault(bucket_name, {}).setdefault(
+        key,
+        {"ok": 0, "fail": 0, "last_rate": 0, "last_error": "", "last_seen": 0},
+    )
+
+
+def _record_health(source="", url="", ok=False, rate=0, error=""):
+    data = _load_health()
+    updates = []
+    if source:
+        updates.append(("sources", source))
+    host = _host_key(url)
+    if host:
+        updates.append(("hosts", host))
+    if not updates:
+        return
+    now = time.time()
+    for bucket_name, key in updates:
+        entry = data.setdefault(bucket_name, {}).setdefault(
+            key,
+            {"ok": 0, "fail": 0, "last_rate": 0, "last_error": "", "last_seen": 0},
+        )
+        entry["last_seen"] = now
+        if ok:
+            entry["ok"] = min(9999, int(entry.get("ok", 0)) + 1)
+            if rate:
+                previous = float(entry.get("last_rate", 0) or 0)
+                entry["last_rate"] = int((previous * 0.7) + (float(rate) * 0.3)) if previous else int(rate)
+            entry["last_error"] = ""
+        else:
+            entry["fail"] = min(9999, int(entry.get("fail", 0)) + 1)
+            entry["last_error"] = str(error)[:240]
+    _save_health(data)
+
+
+def _health_penalty(source, url):
+    penalty = 0.0
+    for bucket_name, key in (("sources", source), ("hosts", _host_key(url))):
+        if not key:
+            continue
+        entry = _health_entry(bucket_name, key)
+        ok = float(entry.get("ok", 0) or 0)
+        fail = float(entry.get("fail", 0) or 0)
+        samples = ok + fail
+        if samples:
+            failure_ratio = fail / samples
+            penalty += min(8.0, failure_ratio * 6.0)
+            if ok >= 3 and failure_ratio < 0.25:
+                penalty -= min(1.5, ok / 20.0)
+        last_rate = float(entry.get("last_rate", 0) or 0)
+        if last_rate and last_rate < _target_probe_rate():
+            penalty += min(2.0, (_target_probe_rate() - last_rate) / float(_target_probe_rate()) * 2.0)
+    return penalty
+
+
+def _stable_health(source, url):
+    source_entry = _health_entry("sources", source) if source else {}
+    host_entry = _health_entry("hosts", _host_key(url)) if url else {}
+    ok = int(source_entry.get("ok", 0) or 0) + int(host_entry.get("ok", 0) or 0)
+    fail = int(source_entry.get("fail", 0) or 0) + int(host_entry.get("fail", 0) or 0)
+    rate = max(float(source_entry.get("last_rate", 0) or 0), float(host_entry.get("last_rate", 0) or 0))
+    return ok >= 6 and fail <= max(1, ok // 8) and rate >= _target_probe_rate()
+
+
+def _health_summary():
+    data = _load_health()
+    sources = data.get("sources", {})
+    hosts = data.get("hosts", {})
+    return {
+        "sources": len(sources),
+        "hosts": len(hosts),
+        "source_failures": sum(int(item.get("fail", 0) or 0) for item in sources.values()),
+        "host_failures": sum(int(item.get("fail", 0) or 0) for item in hosts.values()),
+    }
+
+
+def _mark_bad_source(source, reason):
+    if not source:
+        return
+    _cleanup_bad_streams()
+    with _bad_lock:
+        _bad_sources[source] = {"until": time.time() + _stream_cooldown_ttl(), "reason": str(reason)}
+    _record_health(source=source, ok=False, error=reason)
+
+
+def _mark_bad_host(url, reason):
+    key = _host_key(url)
+    if not key:
+        return
+    _cleanup_bad_streams()
+    with _bad_lock:
+        _bad_hosts[key] = {"until": time.time() + _stream_cooldown_ttl(), "reason": str(reason)}
+    _record_health(url=url, ok=False, error=reason)
+
+
+def _bad_reason(bucket, key):
+    _cleanup_bad_streams()
+    with _bad_lock:
+        value = bucket.get(key)
+        if not value:
+            return ""
+        return value.get("reason", "recent failure")
+
+
+def _bad_source_reason(source):
+    return _bad_reason(_bad_sources, source)
+
+
+def _bad_host_reason(url):
+    key = _host_key(url)
+    return _bad_reason(_bad_hosts, key) if key else ""
+
+
+def _cache_binary_path(name):
+    return os.path.join(utils.CACHE_DIR, "%s.bin" % utils.slugify(name))
+
+
+def _cached_logo_bytes(file_id):
+    path = _cache_binary_path("logo_%s" % file_id)
+    if os.path.exists(path):
+        with open(path, "rb") as infile:
+            return infile.read()
+    data = drive.download_bytes(file_id)
+    with open(path, "wb") as outfile:
+        outfile.write(data)
+    return data
+
+
+def _cached_remote_logo_bytes(url):
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    path = _cache_binary_path("remote_logo_%s" % digest)
+    if os.path.exists(path):
+        with open(path, "rb") as infile:
+            return infile.read()
+    data = utils.requests_get(url).content
+    with open(path, "wb") as outfile:
+        outfile.write(data)
+    return data
+
+
+def _manifest_proxy_url(session_id, upstream_url):
+    return utils.service_url("/proxy.m3u8", sid=session_id, u=utils.encode_token(upstream_url))
+
+
+def _segment_proxy_url(session_id, upstream_url):
+    return utils.service_url("/segment", sid=session_id, u=utils.encode_token(upstream_url))
+
+
+def _should_rewrite_playlist_uri(uri):
+    stripped = str(uri or "").strip()
+    if not stripped:
+        return False
+    return not re.match(r"^(?:data|urn|skd):", stripped, re.I)
+
+
+def _rewrite_key_line(line, session_id, base_url):
+    match = re.search(r'URI="([^"]+)"', line)
+    if not match:
+        return line
+    if not _should_rewrite_playlist_uri(match.group(1)):
+        return line
+    key_url = urljoin(base_url, match.group(1))
+    replacement = _segment_proxy_url(session_id, key_url)
+    return line.replace(match.group(1), replacement)
+
+
+def _rewrite_manifest(text, base_url, session_id):
+    output = []
+    nested_playlist = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#EXT-X-STREAM-INF"):
+            nested_playlist = True
+            output.append(line)
+            continue
+        if stripped.startswith("#EXT-X-KEY"):
+            output.append(_rewrite_key_line(line, session_id, base_url))
+            continue
+        if not stripped or stripped.startswith("#"):
+            output.append(line)
+            continue
+        if not _should_rewrite_playlist_uri(stripped):
+            output.append(line)
+            continue
+
+        absolute = urljoin(base_url, stripped)
+        if nested_playlist or ".m3u8" in absolute:
+            output.append(_manifest_proxy_url(session_id, absolute))
+        else:
+            output.append(_segment_proxy_url(session_id, absolute))
+        nested_playlist = False
+    return "\n".join(output) + "\n"
+
+
+def _first_media_url(text, base_url):
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return urljoin(base_url, stripped)
+    return ""
+
+
+def _m3u_attr(value):
+    return str(value or "").replace('"', "'").replace("\n", " ").strip()
+
+
+def _playlist_entries(mode, group):
+    if mode == "favorites":
+        return [
+            {
+                "name": item["name"],
+                "group": item["group"],
+                "display_name": item.get("nickname") or item["name"],
+            }
+            for item in utils.get_favorites()
+        ]
+    return [
+        {"name": name, "group": group, "display_name": name}
+        for name in vjlive.get_channels_by_group(group).keys()
+    ]
+
+
+def build_playlist(mode="favorites", group="Germany", country=None, epg_url=None):
+    entries = _playlist_entries(mode, group)
+    country = (country or utils.country_code_from_group(entries[0]["group"] if entries else group)).upper()
+    epg_url = epg_url or utils.service_url("/epg.xml", mode=mode, group=group, country=country)
+    xmltv_entries = [{"name": item["name"], "group": item["group"]} for item in entries]
+    _xmltv, matches = epg.build_filtered_xmltv(xmltv_entries, country) if entries else ("", {})
+
+    lines = ['#EXTM3U x-tvg-url="%s"\n' % _m3u_attr(epg_url)]
+    for index, entry in enumerate(entries, 1):
+        matched = matches.get(entry["name"])
+        epg_id = matched["id"] if matched else ""
+        logo_url = drive.logo_service_url(entry["name"], entry["group"])
+        stream_url = utils.service_url("/live.m3u8", name=entry["name"], group=entry["group"])
+        lines.extend(
+                [
+                    "#KODIPROP:inputstream=inputstream.ffmpegdirect\n",
+                    "#KODIPROP:inputstream.ffmpegdirect.manifest_type=hls\n",
+                    "#KODIPROP:inputstream.ffmpegdirect.is_realtime_stream=true\n",
+                    "#KODIPROP:inputstream.ffmpegdirect.playback_as_live=true\n",
+                    "#KODIPROP:inputstream.ffmpegdirect.stream_mode=default\n",
+                    '#EXTINF:-1 tvg-id="%s" tvg-name="%s" tvg-logo="%s" tvg-chno="%d" group-title="%s" catchup="disabled",%s\n'
+                    % (
+                    _m3u_attr(epg_id),
+                    _m3u_attr(entry["display_name"]),
+                    _m3u_attr(logo_url),
+                    index,
+                    _m3u_attr("VavooTV Favorites" if mode == "favorites" else entry["group"]),
+                    entry["display_name"],
+                ),
+                "%s\n" % stream_url,
+            ]
+        )
+    return "".join(lines), entries
+
+
+def write_pvr_files(mode="favorites", group="Germany", country="DE"):
+    m3u_path = os.path.join(utils.ADDON_PROFILE, "pvr-%s.m3u" % mode)
+    epg_path = os.path.join(utils.ADDON_PROFILE, "pvr-%s.xml" % mode)
+    playlist, entries = build_playlist(mode, group, country, epg_url=epg_path)
+    xmltv_entries = [{"name": item["name"], "group": item["group"]} for item in entries]
+    xmltv, _matches = epg.build_filtered_xmltv(xmltv_entries, country) if entries else ("<tv></tv>", {})
+    with open(m3u_path, "w", encoding="utf-8") as outfile:
+        outfile.write(playlist)
+    with open(epg_path, "w", encoding="utf-8") as outfile:
+        outfile.write(xmltv)
+    utils.log("Wrote PVR files: %s / %s (%d channels)" % (m3u_path, epg_path, len(entries)), "proxy", force=True)
+    return m3u_path, epg_path, len(entries)
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    server_version = "VavooTVProxy/6.0"
+
+    def log_message(self, fmt, *args):
+        utils.log(fmt % args, "proxy")
+
+    def _query(self):
+        return parse_qs(urlparse(self.path).query)
+
+    def _query_value(self, key, default=""):
+        values = self._query().get(key)
+        return values[0] if values else default
+
+    def _send_text(self, content, content_type="text/plain; charset=utf-8", status=200):
+        payload = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        if content_type in ("application/vnd.apple.mpegurl", "application/x-mpegURL"):
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_head(self, content_type="text/plain; charset=utf-8", status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        if content_type in ("application/vnd.apple.mpegurl", "application/x-mpegURL"):
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _send_bytes(self, payload, content_type="application/octet-stream", status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/health":
+                self._send_text("ok")
+            elif path == "/status":
+                self._handle_status()
+            elif path == "/refresh_token":
+                self._handle_refresh_token()
+            elif path == "/countries":
+                self._handle_countries()
+            elif path == "/channels":
+                self._handle_channels()
+            elif path == "/catalog":
+                self._handle_catalog()
+            elif path == "/logo.png":
+                self._handle_logo()
+            elif path == "/playlist.m3u":
+                self._handle_playlist()
+            elif path == "/epg.xml":
+                self._handle_epg()
+            elif path == "/live.m3u8":
+                self._handle_live()
+            elif path == "/proxy.m3u8":
+                self._handle_proxy_manifest()
+            elif path == "/segment":
+                self._handle_segment()
+            else:
+                self._send_text("not found", status=404)
+        except Exception as exc:
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                utils.log("Client disconnected while serving %s" % path, "proxy")
+                return
+            utils.log("Proxy error on %s: %s" % (path, exc), "proxy", force=True)
+            try:
+                self._send_text("proxy error", status=500)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                utils.log("Client disconnected before proxy error response for %s" % path, "proxy")
+
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/health":
+            self._send_head()
+        elif path in ("/status", "/countries", "/channels", "/catalog", "/refresh_token"):
+            self._send_head(content_type="application/json; charset=utf-8")
+        elif path == "/logo.png":
+            self._send_head(content_type="image/png")
+        elif path == "/playlist.m3u":
+            self._send_head(content_type="application/vnd.apple.mpegurl")
+        elif path == "/epg.xml":
+            self._send_head(content_type="application/xml; charset=utf-8")
+        elif path in ("/live.m3u8", "/proxy.m3u8"):
+            self._send_head(content_type="video/mp2t")
+        elif path == "/segment":
+            self._send_head(content_type="application/octet-stream")
+        else:
+            self._send_head(status=404)
+
+    def _send_json(self, payload, status=200):
+        self._send_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), content_type="application/json; charset=utf-8", status=status)
+
+    def _handle_status(self):
+        _cleanup_sessions()
+        with _session_lock:
+            sessions = len(_sessions)
+        self._send_json(
+            {
+                "ok": True,
+                "service": "VavooTVProxy",
+                "port": utils.get_proxy_port(),
+                "sessions": sessions,
+                "token": vjlive.auth_signature_status(),
+                "mirrors": vjlive.API_MIRROR_BASE_URLS,
+                "health": _health_summary(),
+            }
+        )
+
+    def _handle_refresh_token(self):
+        vjlive.refresh_auth_signature()
+        self._send_json({"ok": True, "token": vjlive.auth_signature_status()})
+
+    def _handle_countries(self):
+        self._send_json({"countries": vjlive.get_available_countries()})
+
+    def _handle_channels(self):
+        group = self._query_value("country", self._query_value("group", "Germany"))
+        channels = vjlive.get_channels_by_group(group)
+        self._send_json({"country": group, "channels": sorted(channels.keys())})
+
+    def _handle_catalog(self):
+        group = self._query_value("country", self._query_value("group", "Germany"))
+        self._send_json({"country": group, "channels": vjlive.catalog_snapshot(group)})
+
+    def _handle_logo(self):
+        name = self._query_value("name")
+        group = self._query_value("group")
+        logo = drive.find_logo(name, group)
+        if not logo:
+            fallback_url = metadata.logo_url(name, group)
+            if fallback_url:
+                payload = _cached_remote_logo_bytes(fallback_url)
+                content_type = mimetypes.guess_type(fallback_url)[0] or "image/png"
+                self._send_bytes(payload, content_type=content_type)
+                return
+            self._send_bytes(_TRANSPARENT_PNG, content_type="image/png")
+            return
+        payload = _cached_logo_bytes(logo["id"])
+        content_type = mimetypes.guess_type(logo["name"])[0] or "image/png"
+        self._send_bytes(payload, content_type=content_type)
+
+    def _handle_epg(self):
+        mode = self._query_value("mode", "favorites")
+        country = self._query_value("country", utils.get_setting("epg_country", "DE")).upper()
+        group = self._query_value("group")
+        if mode == "favorites":
+            channels = [{"name": item["name"], "group": item["group"]} for item in utils.get_favorites()]
+            xmltv, _matches = epg.build_filtered_xmltv(channels, country)
+        elif group:
+            channels = [{"name": name, "group": group} for name in vjlive.get_channels_by_group(group).keys()]
+            xmltv, _matches = epg.build_filtered_xmltv(channels, country)
+        else:
+            xmltv = epg.get_epg_xml(country)
+        self._send_text(xmltv, content_type="application/xml; charset=utf-8")
+
+    def _handle_playlist(self):
+        mode = self._query_value("mode", "favorites")
+        group = self._query_value("group", "Germany")
+        country = self._query_value(
+            "country",
+            utils.country_code_from_group(group),
+        ).upper()
+        playlist, _entries = build_playlist(mode, group, country)
+        self._send_text(open("/storage/.kodi/userdata/premium_de.m3u").read(), content_type="audio/x-mpegurl")
+
+    def _handle_live(self):
+        name = self._query_value("name")
+        group = self._query_value("group", "Germany")
+        candidates = vjlive.resolve_stream_candidates(name, group)
+        errors = []
+        tested = []
+        skipped = []
+
+        active = []
+        for candidate in candidates:
+            source_reason = _bad_source_reason(candidate.get("source", ""))
+            host_reason = _bad_host_reason(candidate.get("url", ""))
+            if source_reason or host_reason:
+                skipped.append("%s: cooldown %s" % (candidate.get("source", candidate.get("url")), source_reason or host_reason))
+                continue
+            active.append(candidate)
+        if not active:
+            active = candidates
+
+        for candidate in active:
+            resolved_url = candidate["url"]
+            headers = candidate.get("headers", {})
+            if ".m3u8" not in resolved_url.lower():
+                self._send_redirect(resolved_url)
+                return
+            session_id = _register_session(headers, candidate.get("source", ""))
+            try:
+                tested.append(self._test_candidate(candidate, session_id))
+            except Exception as exc:
+                _drop_session(session_id)
+                _mark_bad_source(candidate.get("source", ""), exc)
+                _mark_bad_host(resolved_url, exc)
+                errors.append("%s: %s" % (candidate.get("source", resolved_url), exc))
+                utils.log("Skipping failed stream variant for %s: %s" % (name, exc), "proxy")
+                continue
+
+        if tested:
+            selected = min(tested, key=lambda item: item["score"])
+            for item in tested:
+                if item["session_id"] != selected["session_id"]:
+                    _drop_session(item["session_id"])
+            utils.log(
+                "Selected stream variant for %s: score=%.2f rate=%.0fKB/s source=%s first=%s"
+                % (name, selected["score"], selected.get("probe_rate", 0) / 1024.0, selected["source"], selected["first_url"]),
+                "proxy",
+                force=True,
+            )
+            self._send_text(selected["rewritten"], content_type="application/vnd.apple.mpegurl")
+            return
+
+        details = errors + skipped
+        raise RuntimeError("All stream variants failed playback probe: %s" % "; ".join(details))
+
+    def _handle_proxy_manifest(self):
+        session_id = self._query_value("sid")
+        upstream = utils.decode_token(self._query_value("u"))
+        self._serve_manifest(upstream, session_id)
+
+    def _serve_manifest(self, upstream_url, session_id):
+        _manifest_text, _manifest_url, rewritten = self._load_manifest(upstream_url, session_id)
+        self._send_text(rewritten, content_type="application/vnd.apple.mpegurl")
+
+    def _load_manifest(self, upstream_url, session_id, timeout=None):
+        headers = dict(_get_session(session_id).get("headers", {}))
+        kwargs = {"headers": headers}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        response = utils.requests_get(upstream_url, **kwargs)
+        rewritten = _rewrite_manifest(response.text, response.url, session_id)
+        return response.text, response.url, rewritten
+
+    def _probe_manifest(self, manifest_text, manifest_url, session_id, depth=0, timeout=None):
+        first_url = _first_media_url(manifest_text, manifest_url)
+        if not first_url:
+            return ""
+        headers = dict(_get_session(session_id).get("headers", {}))
+        if ".m3u8" in first_url.lower() and depth < 2:
+            kwargs = {"headers": headers}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            response = utils.requests_get(first_url, **kwargs)
+            return self._probe_manifest(response.text, response.url, session_id, depth + 1, timeout=timeout)
+
+        probe_headers = dict(headers)
+        probe_headers.setdefault("Range", "bytes=0-%d" % (_PROBE_BYTES - 1))
+        kwargs = {"headers": probe_headers, "stream": True}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        response = utils.requests_get(first_url, **kwargs)
+        start = time.time()
+        size = 0
+        try:
+            for chunk in response.iter_content(65536):
+                if chunk:
+                    size += len(chunk)
+                    if size >= _PROBE_BYTES:
+                        break
+        finally:
+            response.close()
+        elapsed = max(time.time() - start, 0.001)
+        rate = float(size) / elapsed
+        if size < 65536:
+            raise RuntimeError("segment probe returned too little data")
+        min_rate = _min_probe_rate()
+        if rate < min_rate:
+            raise RuntimeError("segment probe too slow: %.0f KB/s" % (rate / 1024.0))
+        return {"url": first_url, "bytes": size, "elapsed": elapsed, "rate": rate}
+
+    def _test_candidate(self, candidate, session_id):
+        start = time.time()
+        manifest_text, manifest_url, rewritten = self._load_manifest(candidate["url"], session_id, timeout=_PROBE_TIMEOUT)
+        probe = self._probe_manifest(manifest_text, manifest_url, session_id, timeout=_PROBE_TIMEOUT)
+        elapsed = time.time() - start
+        score = elapsed
+        first_url = probe.get("url") if probe else ""
+        rate = probe.get("rate", 0) if probe else 0
+        target_rate = _target_probe_rate()
+        if rate and rate < target_rate:
+            score += (target_rate - rate) / float(target_rate) * 4.0
+        parsed = urlparse(first_url or manifest_url)
+        source = candidate.get("source", candidate["url"])
+        score += _health_penalty(source, first_url or manifest_url)
+        if parsed.port == 8008:
+            score += 1.5
+        if _is_ip_literal(parsed.hostname or ""):
+            score += 1.0
+        _record_health(source=source, url=first_url or manifest_url, ok=True, rate=rate)
+        return {
+            "session_id": session_id,
+            "source": source,
+            "manifest_url": manifest_url,
+            "first_url": first_url,
+            "rewritten": rewritten,
+            "score": score,
+            "probe_rate": rate,
+        }
+
+    def _open_segment_buffered(self, upstream, headers, source):
+        retries = _segment_retry_count()
+        max_buffer = _segment_buffer_bytes() if _stable_health(source, upstream) else _segment_start_buffer_bytes()
+        last_exc = None
+        for attempt in range(retries + 1):
+            response = None
+            start = time.time()
+            size = 0
+            chunks = []
+            fully_buffered = True
+            try:
+                response = utils.requests_get(upstream, headers=headers, stream=True, timeout=_segment_timeout())
+                for chunk in response.iter_content(65536):
+                    if not chunk:
+                        continue
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if max_buffer and size > max_buffer:
+                        fully_buffered = False
+                        break
+                elapsed = max(time.time() - start, 0.001)
+                if fully_buffered:
+                    response.close()
+                    _record_health(source=source, url=upstream, ok=True, rate=float(size) / elapsed if size else 0)
+                return response, chunks, fully_buffered, size
+            except Exception as exc:
+                last_exc = exc
+                if response is not None:
+                    response.close()
+                if attempt < retries:
+                    utils.log(
+                        "Segment retry %d/%d for source=%s after %s"
+                        % (attempt + 1, retries, source, exc),
+                        "proxy",
+                        force=True,
+                    )
+                    continue
+                raise last_exc
+
+    def _send_segment_headers(self, response, buffered_size, fully_buffered):
+        self.send_response(response.status_code)
+        if response.headers.get("Content-Type"):
+            self.send_header("Content-Type", response.headers["Content-Type"])
+        if fully_buffered:
+            self.send_header("Content-Length", str(buffered_size))
+        elif response.headers.get("Content-Length"):
+            self.send_header("Content-Length", response.headers["Content-Length"])
+        if response.headers.get("Content-Range"):
+            self.send_header("Content-Range", response.headers["Content-Range"])
+        if response.headers.get("Accept-Ranges"):
+            self.send_header("Accept-Ranges", response.headers["Accept-Ranges"])
+        self.end_headers()
+
+    def _handle_segment(self):
+        session_id = self._query_value("sid")
+        upstream = utils.decode_token(self._query_value("u"))
+        headers = dict(_get_session(session_id).get("headers", {}))
+        client_range = self.headers.get("Range")
+        if client_range:
+            headers["Range"] = client_range
+
+        source = _get_session(session_id).get("source", "")
+        try:
+            response, buffered_chunks, fully_buffered, buffered_size = self._open_segment_buffered(upstream, headers, source)
+        except Exception as exc:
+            source = _get_session(session_id).get("source", "")
+            _mark_bad_source(source, exc)
+            _mark_bad_host(upstream, exc)
+            utils.log("Segment upstream failed: %s source=%s (%s)" % (upstream, source, exc), "proxy", force=True)
+            raise
+        self._send_segment_headers(response, buffered_size, fully_buffered)
+        try:
+            for chunk in buffered_chunks:
+                self.wfile.write(chunk)
+            if fully_buffered:
+                return
+            for chunk in response.iter_content(65536):
+                if chunk:
+                    self.wfile.write(chunk)
+            _record_health(source=source, url=upstream, ok=True)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            utils.log("Segment client disconnected", "proxy")
+        except Exception as exc:
+            _mark_bad_source(source, exc)
+            _mark_bad_host(upstream, exc)
+            utils.log("Segment streaming failed: %s source=%s (%s)" % (upstream, source, exc), "proxy", force=True)
+            raise
+        finally:
+            response.close()
+
+
+def ensure_server():
+    global _server, _server_thread
+
+    if _server is not None:
+        return _server
+
+    port = utils.get_proxy_port()
+    _server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
+    _server_thread = threading.Thread(target=_server.serve_forever, name="VavooTVProxy", daemon=True)
+    _server_thread.start()
+    utils.log("Proxy server listening on 127.0.0.1:%d" % port, "proxy", force=True)
+    return _server
+
+
+def shutdown_server():
+    global _server, _server_thread
+    if _server is not None:
+        _server.shutdown()
+        _server.server_close()
+        _server = None
+        _server_thread = None
+
+
+def run_service_loop():
+    ensure_server()
+    monitor = xbmc.Monitor()
+    while not monitor.abortRequested():
+        monitor.waitForAbort(1)
+    shutdown_server()

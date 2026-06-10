@@ -1,0 +1,87 @@
+#EXTM3U
+#KODIPROP:inputstream=inputstream.ffmpegdirect
+#KODIPROP:inputstream.ffmpegdirect.manifest_type=hls
+#KODIPROP:inputstream.ffmpegdirect.is_realtime_stream=true
+#KODIPROP:inputstream.ffmpegdirect.playback_as_live=true
+#EXTINF:-1 tvg-name="Das Erste HD" tvg-id="DasErste.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/daserstehd.png",Das Erste HD
+https://daserste-live.ard-mcdn.de/daserste/live/hls/de/master.m3u8
+#EXTINF:-1 tvg-name="ZDF HD" tvg-id="ZDF.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/zdfhd.png",ZDF HD
+https://zdf-hls-15.akamaized.net/hls/live/2016498/de/veryhigh/master.m3u8
+#EXTINF:-1 tvg-name="3sat" tvg-id="3sat.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/3sat.png",3sat
+https://zdf-hls-18.akamaized.net/hls/live/2016501/dach/veryhigh/master.m3u8
+#EXTINF:-1 tvg-name="ARTE HD" tvg-id="ARTE.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/artehd.png",ARTE HD
+https://artesimulcast.akamaized.net/hls/live/2030993/artelive_de/master.m3u8
+#EXTINF:-1 tvg-name="DF1 HD" tvg-id="DF1.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/df1.png",DF1 HD
+https://d287776cjxyfeq.cloudfront.net/out/v1/08823cd7fba74508a5a577fd51dc41f6/index.m3u8
+#EXTINF:-1 tvg-name="ARD-alpha" tvg-id="ARD-alpha.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/ardalpha.png",ARD-alpha
+https://mcdn.br.de/br/fs/ard_alpha/hls/de/master.m3u8
+#EXTINF:-1 tvg-name="one HD" tvg-id="One.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/onehd.png",one HD
+https://mcdn-one.ard.de/ardone/hls/master.m3u8
+#EXTINF:-1 tvg-name="ZDFneo HD" tvg-id="ZDFneo.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/zdfneohd.png",ZDFneo HD
+https://zdf-hls-16.akamaized.net/hls/live/2016499/de/veryhigh/master.m3u8
+#EXTINF:-1 tvg-name="ZDFinfo HD" tvg-id="ZDFinfo.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/zdfinfohd.png",ZDFinfo HD
+https://zdf-hls-17.akamaized.net/hls/live/2016500/de/veryhigh/master.m3u8
+#EXTINF:-1 tvg-name="phoenix HD" tvg-id="phoenix.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/phoenix.png",phoenix
+https://zdf-hls-19.akamaized.net/hls/live/2016502/de/veryhigh/master.m3u8
+#EXTINF:-1 tvg-name="tagesschau24" tvg-id="tagesschau24.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/tagesschau24.png",tagesschau24
+https://tagesschau.akamaized.net/hls/live/2020115/tagesschau/tagesschau_1/master.m3u8
+#EXTINF:-1 tvg-name="WELT" tvg-id="WELT.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/welt.png",WELT
+https://welt.personalstream.tv/v1/master.m3u8
+#EXTINF:-1 tvg-name="ANIXE HD" tvg-id="Anixe.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/anixehd.png",ANIXE HD
+https://ma.anixa.tv/clips/stream/anixehd/index.m3u8
+#EXTINF:-1 tvg-name="Dokusat" tvg-id="Dokusat.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/dokusat.png",Dokusat
+https://muc3.iptv-playoutcenter.de/dokusat/dokusat1/playlist.m3u8
+#EXTINF:-1 tvg-name="KiKA" tvg-id="Kika.de" group-title="Öffentlich-Rechtliche" tvg-logo="https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/logos/tv/kika.png",KiKA
+https://kikageohls.akamaized.net/hls/live/2022693/livetvkika_de/master.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="ANIMAL PLANET" tvg-logo="http://127.0.0.1:37890/logo.png?name=ANIMAL+PLANET&group=Germany" tvg-chno="1" group-title="Premium" catchup="disabled",ANIMAL PLANET
+http://127.0.0.1:37890/live.m3u8?name=ANIMAL+PLANET&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="NAT GEO" tvg-logo="http://127.0.0.1:37890/logo.png?name=NAT+GEO&group=Germany" tvg-chno="2" group-title="Premium" catchup="disabled",NAT GEO
+http://127.0.0.1:37890/live.m3u8?name=NAT+GEO&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SKY NATURE" tvg-logo="http://127.0.0.1:37890/logo.png?name=SKY+NATURE&group=Germany" tvg-chno="4" group-title="Premium" catchup="disabled",SKY NATURE
+http://127.0.0.1:37890/live.m3u8?name=SKY+NATURE&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SPIEGEL GESCHICHTE" tvg-logo="http://127.0.0.1:37890/logo.png?name=SPIEGEL+GESCHICHTE&group=Germany" tvg-chno="5" group-title="Premium" catchup="disabled",SPIEGEL GESCHICHTE
+http://127.0.0.1:37890/live.m3u8?name=SPIEGEL+GESCHICHTE&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SKY DOCUMENTARIES" tvg-logo="http://127.0.0.1:37890/logo.png?name=SKY+DOCUMENTARIES&group=Germany" tvg-chno="6" group-title="Premium" catchup="disabled",SKY DOCUMENTARIES
+http://127.0.0.1:37890/live.m3u8?name=SKY+DOCUMENTARIES&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="WELT DER WUNDER" tvg-logo="http://127.0.0.1:37890/logo.png?name=WELT+DER+WUNDER&group=Germany" tvg-chno="7" group-title="Premium" catchup="disabled",WELT DER WUNDER
+http://127.0.0.1:37890/live.m3u8?name=WELT+DER+WUNDER&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="AXN" tvg-logo="http://127.0.0.1:37890/logo.png?name=AXN&group=Germany" tvg-chno="9" group-title="Premium" catchup="disabled",AXN
+http://127.0.0.1:37890/live.m3u8?name=AXN&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SONY CHANNEL" tvg-logo="http://127.0.0.1:37890/logo.png?name=SONY+CHANNEL&group=Germany" tvg-chno="11" group-title="Premium" catchup="disabled",SONY CHANNEL
+http://127.0.0.1:37890/live.m3u8?name=SONY+CHANNEL&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="UNIVERSAL TV" tvg-logo="http://127.0.0.1:37890/logo.png?name=UNIVERSAL+TV&group=Germany" tvg-chno="12" group-title="Premium" catchup="disabled",UNIVERSAL TV
+http://127.0.0.1:37890/live.m3u8?name=UNIVERSAL+TV&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="WARNER TV FILM" tvg-logo="http://127.0.0.1:37890/logo.png?name=WARNER+TV+FILM&group=Germany" tvg-chno="15" group-title="Premium" catchup="disabled",WARNER TV FILM
+http://127.0.0.1:37890/live.m3u8?name=WARNER+TV+FILM&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="PRO 7 FUN" tvg-logo="http://127.0.0.1:37890/logo.png?name=PRO+7+FUN&group=Germany" tvg-chno="16" group-title="Premium" catchup="disabled",PRO 7 FUN
+http://127.0.0.1:37890/live.m3u8?name=PRO+7+FUN&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="DELUXE MUSIC" tvg-logo="http://127.0.0.1:37890/logo.png?name=DELUXE+MUSIC&group=Germany" tvg-chno="17" group-title="Premium" catchup="disabled",DELUXE MUSIC
+http://127.0.0.1:37890/live.m3u8?name=DELUXE+MUSIC&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="AUTO MOTOR SPORT" tvg-logo="http://127.0.0.1:37890/logo.png?name=AUTO+MOTOR+SPORT&group=Germany" tvg-chno="20" group-title="Premium" catchup="disabled",AUTO MOTOR SPORT
+http://127.0.0.1:37890/live.m3u8?name=AUTO+MOTOR+SPORT&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="MOTORVISION TV" tvg-logo="http://127.0.0.1:37890/logo.png?name=MOTORVISION+TV&group=Germany" tvg-chno="21" group-title="Premium" catchup="disabled",MOTORVISION TV
+http://127.0.0.1:37890/live.m3u8?name=MOTORVISION+TV&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SKY SPORT F1" tvg-logo="http://127.0.0.1:37890/logo.png?name=SKY+SPORT+F1&group=Germany" tvg-chno="22" group-title="Premium" catchup="disabled",SKY SPORT F1
+http://127.0.0.1:37890/live.m3u8?name=SKY+SPORT+F1&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="EUROSPORT 1" tvg-logo="http://127.0.0.1:37890/logo.png?name=EUROSPORT+1&group=Germany" tvg-chno="23" group-title="Premium" catchup="disabled",EUROSPORT 1
+http://127.0.0.1:37890/live.m3u8?name=EUROSPORT+1&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SKY ATLANTIC" tvg-logo="http://127.0.0.1:37890/logo.png?name=SKY+ATLANTIC&group=Germany" tvg-chno="25" group-title="Premium" catchup="disabled",SKY ATLANTIC
+http://127.0.0.1:37890/live.m3u8?name=SKY+ATLANTIC&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SKY CINEMA PREMIERE" tvg-logo="http://127.0.0.1:37890/logo.png?name=SKY+CINEMA+PREMIERE&group=Germany" tvg-chno="30" group-title="Premium" catchup="disabled",SKY CINEMA PREMIERE
+http://127.0.0.1:37890/live.m3u8?name=SKY+CINEMA+PREMIERE&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SKY REPLAY" tvg-logo="http://127.0.0.1:37890/logo.png?name=SKY+REPLAY&group=Germany" tvg-chno="32" group-title="Premium" catchup="disabled",SKY REPLAY
+http://127.0.0.1:37890/live.m3u8?name=SKY+REPLAY&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SYFY" tvg-logo="http://127.0.0.1:37890/logo.png?name=SYFY&group=Germany" tvg-chno="33" group-title="Premium" catchup="disabled",SYFY
+http://127.0.0.1:37890/live.m3u8?name=SYFY&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="ORF 1" tvg-logo="http://127.0.0.1:37890/logo.png?name=ORF+1&group=Germany" tvg-chno="34" group-title="Premium" catchup="disabled",ORF 1
+http://127.0.0.1:37890/live.m3u8?name=ORF+1&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="ORF 2" tvg-logo="http://127.0.0.1:37890/logo.png?name=ORF+2&group=Germany" tvg-chno="35" group-title="Premium" catchup="disabled",ORF 2
+http://127.0.0.1:37890/live.m3u8?name=ORF+2&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="13TH STREET" tvg-logo="http://127.0.0.1:37890/logo.png?name=13TH+STREET&group=Germany" tvg-chno="38" group-title="Premium" catchup="disabled",13TH STREET
+http://127.0.0.1:37890/live.m3u8?name=13TH+STREET&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="DISCOVERY CHANNEL" tvg-logo="http://127.0.0.1:37890/logo.png?name=DISCOVERY+CHANNEL&group=Germany" tvg-chno="41" group-title="Premium" catchup="disabled",DISCOVERY CHANNEL
+http://127.0.0.1:37890/live.m3u8?name=DISCOVERY+CHANNEL&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="HISTORY" tvg-logo="http://127.0.0.1:37890/logo.png?name=HISTORY&group=Germany" tvg-chno="43" group-title="Premium" catchup="disabled",HISTORY
+http://127.0.0.1:37890/live.m3u8?name=HISTORY&group=Germany
+#EXTINF:-1 tvg-id="" tvg-name="SERVUS TV" tvg-logo="http://127.0.0.1:37890/logo.png?name=SERVUS+TV&group=Germany" tvg-chno="46" group-title="Premium" catchup="disabled",SERVUS TV
+http://127.0.0.1:37890/live.m3u8?name=SERVUS+TV&group=Germany
