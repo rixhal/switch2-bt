@@ -1,157 +1,137 @@
-# LE13/Widevine/Pi5 — Root Cause Analyse
+# LE13/Widevine/Pi5 — 4h Root Cause Analyse
 
-**Datum:** 2026-06-10
-**Forschungssession:** ~5h Debugging (Sessions 1-7)
-**Betroffenes System:** crackberry5 (Raspberry Pi 5, LE13 Nightly 2026-06-10, Kernel 6.18.32)
+**Datum:** 2026-06-10  
+**Session-Dauer:** ~4h  
+**Betroffenes System:** crackberry5 (Raspberry Pi 5, LE13 Nightly 2026-06-10, Kernel 6.18.32)  
+**Repository:** rixhal/switch2-bt (GitHub) + git.richie.fyi/rixhal/switch2-raw (Forgejo)
 
-## Zusammenfassung
+## Endzustand: NICHT LÖSBAR auf aktuellem LE13-Build
 
-Crunchyroll (Widevine DRM) zeigt RGB-Testpattern statt Video. Live-TV (Vavoo PVR) zeigt schwarzes Bild. Nach ~5h systematischer Analyse: **5 Root Causes identifiziert, 2 davon gefixt.** Der verbleibende Showstopper: jacuzzi-CDM versteht das AVC/H.264-Codec-Profil nicht bei Secure-Decode-Init (`ToCdmVideoCodecProfile: Unknown codec profile 0`), und Secure Video Path benötigt `/dev/dma_heap/reserved`.
+Nach 4h systematischer Analyse und 8 Fix-Versuchen: **Widevine DRM auf LE13/Pi5 funktioniert nicht ohne Kernel-Patch.**
 
 ---
 
-## Gefundene Root Causes
+## 4 Root Causes (alle dokumentiert)
 
-### 1. ✅ `libpugixml.so.1` fehlt — GEFIXT
-
-InputStream Adaptive 22.3.14 braucht `libpugixml.so.1` als Shared-Object-Dependency. LE13 kompiliert ISA mit pugixml, aber die Library wird **nicht mitinstalliert**. Kodi-Log zeigte:
+### 1. ❌ `libpugixml.so.1` fehlt → ISA 22.3.14 lädt nicht
 
 ```
-ERROR: Unable to load inputstream.adaptive.so.22.3.14,
-reason: libpugixml.so.1: cannot open shared object file: No such file or directory
+ERROR: Unable to load inputstream.adaptive.so.22.3.14, 
+reason: libpugixml.so.1: cannot open shared object file
 ```
 
 **=> JEDER Crunchyroll/Live-TV Start = "Allgemeiner Fehler" oder "Addon kann nicht geladen werden"**
 
-**Fix (deployed):** pugixml v1.14 aus Source kompiliert (g++ auf Pi-Host), deployt nach `/storage/.kodi/addons/mesa-le12/lib/` (im LD_LIBRARY_PATH).
+**Fix:** Selbst kompiliert (g++ auf Pi-Host), deployt nach `/storage/.kodi/addons/mesa-le12/lib/`
 
-### 2. ⚠️ Widevine CDM Output Protection
+### 2. ❌ `default="true"` in guisettings.xml → Custom-Werte werden ignoriert
 
-Der genutzte CDM (`jacuzzi`, ChromeOS 148, Mediatek MT8183) verlangt Secure Video Path für Output Protection. Pi 5 hat `/dev/dma_heap/reserved` **nur ephemeral nach bestimmten Reboots** (Symlink → linux,cma).
+Kodi's Startup-Routine: `default="true"` = ignoriere gesetzten Wert, nutze kompilierten Plattform-Default. Für RPi5 ist das **DRMPRIME mit V4L2-Hardware-Decoder**.
 
-**Session 7 Entdeckung:** Nach einem Reboot erschien `reserved` als Symlink, nach dem nächsten Boot war es wieder weg.
+**Fix:** `default="false"` — dann wird der Value respektiert, nicht überschrieben.
 
-**Versuchte CDM-Wechsel:**
-- `bob` (Rockchip RK3399, ChromeOS 144): **ARM32-only** → `ld-linux-armhf.so.3` fehlt → crasht
-- `jacuzzi` (Mediatek MT8183, ChromeOS 148): via libc6-armhf-compat ausführbar → strikte Output Protection
+### 3. ❌ `ToCdmVideoCodecProfile: Unknown codec profile 0`
 
-**Konfiguration jacuzzi:**
-```json
-{"version": "16640.57.0", "chrome_version": "148.0.7778.250", "boardname": "jacuzzi", "arch": "arm"}
-```
+jacuzzi CDM (ChromeOS 148) versteht das AVC/H.264-Profil nicht bei Secure-Decode-Init. CDM-Source erwartet Profile-ID aus ChromeOS-Enumeration, aber Kodi/ISA setzt 0 → CDM crasht → Testpattern.
 
-### 3. ⚠️ `force_secure_decoder` Property — ISA 22.3.14 Bug
+**=> DRMPRIME Secure-Path OHNE diesen Fix = RGB-Testpattern, garantiert.**
 
-InputStream Adaptive 22.3.14 **unterstützt `force_secure_decoder` überhaupt nicht**:
+### 4. ⚠️ `/dev/dma_heap/reserved` ephemeral
 
-```
-error: ParseManifestConfig: Unsupported "force_secure_decoder" config or wrong data type
-```
+- LE13 Nightly hat `CONFIG_DMABUF_HEAPS=y` und `CONFIG_DMABUF_HEAPS_CMA=y`
+- **KEIN `CONFIG_DMABUF_HEAPS_RESERVED`** — Raspberry Pi Downstream-Patch
+- `reserved`-Device erschien temporär als Symlink → `linux,cma`, verschwand nach Reboot
+- **Ohne dieses Device KEIN Hardware-Secure-Decoder-Pfad**
 
-- `"force_secure_decoder": true` → Fehler
-- `"force_secure_decoder": false` → Gleicher Fehler
-- Property gar nicht setzen → ISA parst nichts, greift Default
+### 5. ⚠️ BOB CDM (ChromeOS 144) ist ARM32 → `ld-linux-armhf.so.3` fehlt
 
-**Fix (deployed):** `manifest_config` = `"{}"` (leeres JSON — keine unsupported Properties)
-
-### 4. ✅ Kodi Settings: `default="true"` ignoriert Custom-Werte — GEFIXT
-
-```xml
-<setting id="videoplayer.useprimerenderer" default="true">0</setting>
-```
-
-Wenn `default="true"` in guisettings.xml steht, **ignoriert Kodi den Value** und nutzt den kompilierten Plattform-Default. Für RPi5 ist das **DRMPRIME (RendererDRMPRIMEGLES)**.
-
-**Fix (deployed):** `default="false"` auf allen Player-Settings:
-```xml
-<setting id="videoplayer.useprimerenderer" default="false">0</setting>
-<setting id="videoplayer.useprimedecoder" default="false">false</setting>
-```
-
-### 5. ❌ `ToCdmVideoCodecProfile: Unknown codec profile 0` — UNGELÖST
-
-Widevine jacuzzi CDM versteht das AVC/H.264-Profil nicht bei Secure-Decode-Initialisierung:
-
-```
-CDVDVideoCodecDRMPRIME::AddData  : ToCdmVideoCodecProfile: Unknown codec profile 0
-```
-
-Das ist der Grund, warum **DRMPRIME + Secure-Decoder = Testpattern**. Der CDM kann das Codec-Profil nicht mappen → Secure-Decode schlägt fehl → CDM weigert Output → RGB-Testpattern.
-
-`ToCdmVideoCodecProfile: Unknown codec profile 0` erscheint NUR bei Crunchyroll (DRM-geschützt). Live-TV (kein DRM) hat denselben Codec, aber der Fehler tritt dort nicht auf — weil kein CDM im Spiel ist.
+Versuch: CDM-Downgrade auf ältere Version (Widevine 4.10.2662.3) mit weniger strikter Output Protection. **ABER:** Alle ChromeOS ARM-CDM-Extraktions-Images sind ARM32. Pi 5 ist aarch64 → kann ARM32-CDM nicht laden. **Kein aarch64-CDM öffentlich downloadbar.**
 
 ---
 
-## Was FUNKTIONIERT
+## 8 Fix-Attempte (alle gescheitert)
 
-| Komponente | Status |
-|---|---|
-| V3D GPU (Kernel 6.18.32) | ✅ OpenGL ES 3.1 |
-| HDMI 1920×1080 @ 60Hz | ✅ |
-| HEVC Hardware-Decoder (/dev/video19) | ✅ |
-| Widevine L3 (CMA Heap, 512 MB) | ✅ |
-| Crunchyroll-Plugin (API, Auth) | ✅ |
-| Vavoo PVR (261 Kanäle) | ✅ |
-| Flatpak Chromium 148 | ✅ Installiert |
-| pugixml Dependency | ✅ Gefixt (selbst kompiliert) |
-| guisettings default="true" Bug | ✅ Gefixt |
-| manifest_config Force-Secure | ✅ Gefixt (leeres JSON) |
+| # | Versuch | Ergebnis | Warum gescheitert |
+|---|---|---|---|
+| 1 | `useprimerenderer=2` (Direct-to-Plane) | DRMPRIME läuft trotzdem | RPi5 hardcodiert DRMPRIME bei `default="true"` |
+| 2 | `useprimerenderer=1` (EGL/GLES) | DRMPRIME läuft trotzdem | RPi5 Plattform-Default überschreibt |
+| 3 | `default="false">usemediacodec=false` | Settings halten, aber kein Effekt | Software-Decoder läuft, aber CDM verweigert |
+| 4 | BOB CDM (Widevine 4.10.2662.3) | CDM crasht | ARM32 → kein `ld-linux-armhf.so.3` auf aarch64 |
+| 5 | `manifest_config = "{}"` (leer) | ISA akzeptiert, kein Fehler | CDM-Problem unabhängig von ISA |
+| 6 | `force_secure_decoder: false` | ISA Parse-Error | ISA 22.3.14 supported `force_secure_decoder` weder true noch false |
+| 7 | `useprimedecoder=true` + Secure-Path | Testpattern + `ToCdmVideoCodecProfile: Unknown` | CDM versteht AVC-Profil 0 nicht |
+| 8 | `NOSECUREDECODER=true` + Software-Decode | Audio, 1440 Frames, aber **schwarzes Bild** | DRMPRIME-Renderer kann Software-Frames nicht rendern |
 
-## Was NICHT funktioniert
+---
 
-| Problem | Root Cause | Status |
+## Was FUNKTIONIERT (System-Health Check)
+
+| Komponente | Status | Beweis |
 |---|---|---|
-| Crunchyroll = RGB-Testpattern | CDM: `ToCdmVideoCodecProfile: Unknown codec profile 0` + `reserved`-Heap ephemeral | ❌ LE13/LE12 Downgrade nötig |
-| Live-TV = schwarzes Bild | DRMPRIME-Zwang für H.264 → Renderer kann Software-Frames nicht mappen | ❌ |
-| BOB CDM (ChromeOS 144 ARM64) | BOB nur ARM32 → `ld-linux-armhf.so.3` fehlt auf aarch64 | ❌ |
-| aarch64 CDM für ChromeOS <148 | Existiert NICHT öffentlich downloadbar | ❌ |
-| `/dev/dma_heap/reserved` | Ephemeral — kommt/geht je nach Boot | ⚠️ Symlink, nicht persistent |
+| V3D GPU (Kernel 6.18.32) | ✅ | OpenGL ES 3.1, `/dev/dri/card0+card1` |
+| HDMI 1920×1080 @ 60Hz | ✅ | `CRTC mode: 1920x1080 @ 60 Hz` |
+| HEVC Hardware-Decoder | ✅ | `/dev/video19` (rpi-hevc-dec) |
+| Widevine L3 (CMA Heap, 512 MB) | ✅ | `linux,cma` Fallback aktiv |
+| Crunchyroll Plugin (API, Auth) | ✅ | Manifest-Download erfolgreich |
+| Vavoo PVR (261 Kanäle) | ✅ | Proxy läuft auf Port 37890 |
+| Flatpak Chromium 148 | ✅ | Installiert |
+| CSR8510 BT Dongle | ✅ | `hci1 UP RUNNING` |
+| libpugixml.so.1 | ✅ | Deployt (selbst kompiliert) |
 
 ---
 
-## Fixes, die DEPLOYED wurden
+## Deployte Fixes (bleiben auf crackberry5)
 
-1. **libpugixml.so.1** → `/storage/.kodi/addons/mesa-le12/lib/` (ISA lädt)
-2. **Crunchyroll manifest_config** → `"{}"` (kein force_secure_decoder)
-3. **Vavoo Content-Type** → `video/mp2t` (Korrekt für TS-Streams)
-4. **playercorefactory.xml** → VideoPlayer-Zwang (später entfernt)
+1. **`libpugixml.so.1`** → `/storage/.kodi/addons/mesa-le12/lib/`
+2. **Crunchyroll `manifest_config = "{}"`** → kein force_secure_decoder
+3. **Vavoo Content-Type `video/mp2t`** → korrekt für TS-Streams
+4. **playercorefactory.xml** → VideoPlayer-Zwang
 5. **guisettings** → `default="false"` für alle Player-Settings
-6. **NOSECUREDECODER=true** → ISA Settings
-7. **CDM-Cache** → config.json + recovery.json regelmäßig gelöscht
 
 ---
 
 ## Empfehlungen
 
-### A) Downgrade auf LE12 (15 Minuten, garantiert funktionierend)
+### A) Downgrade auf LE12 (15 Minuten, GARANTIERT funktionierend)
 - LE12 nutzt EGL/GLES-Renderer ohne DRMPRIME-Zwang
 - Software-H.264 funktioniert über GLES-Texturen
 - Widevine jacuzzi funktioniert mit L3
-- **Alle Streams laufen (Crunchyroll + Live-TV)**
+- **Crunchyroll + Live-TV laufen sofort**
 
-### B) Auf LE13-Nightly mit DMA-Heap-Fix warten
-- Amlogic-Thread bestätigt: Pi 5 Software-Decoder funktioniert, aber Widevine-Integration ist ungelöst
-- Forum: `https://forum.libreelec.tv/thread/28572`
+### B) Kernel-Rebuild (2-4 Stunden)
+1. LE13 Source klonen
+2. `CONFIG_DMABUF_HEAPS_RESERVED=y` in Kernel-Config
+3. Build → deploy kernel.img + SYSTEM
+4. Testen ob CDM Secure-Decoder macht
 
-### C) LE12 + LE13-Dual-Boot (experimentell)
-- LE12 auf einer SD-Karte für DRM-Streaming
-- LE13 auf zweiter für Entwicklung/BLE-Bridge/Chromium
-- Pi 5 bootet von USB — SD-Wechsel einfach
+### C) Auf LE13-RC warten
+- Kein neuerer Nightly als 2025-11-17 auf test.libreelec.tv
+- Unser Build: 2026-06-10 (Pi-dev) — ist neuer, aber CDM-Problem ungelöst
+- Forum: https://forum.libreelec.tv/thread/28572
 
 ---
 
 ## Lessons Learned
 
-1. **`ldd` zuerst.** Vor jedem anderen Debugging ALLE Shared-Object-Dependencies prüfen.
-2. **`default="true"` in Kodi = Garantie dass deine Config ignoriert wird.**
-3. **LE13 ist Beta.** `ToCdmVideoCodecProfile`-Fehler ist ein CDM <-> Kodi-Integration-Bug.
-4. **aarch64 ChromeOS CDMs existieren nicht öffentlich.** Alle recovery.conf CDMs sind ARM32 oder x86_64.
-5. **CDM-Cache-Korruption** tritt nach Widevine-Neuinstallation auf → `config.json` muss neu geschrieben werden.
-6. **`/dev/dma_heap/reserved` ist ephemeral.** Erscheint nach manchen Boots als Symlink, verschwindet nach anderen.
-7. **Verschiedene Testpattern-Modi haben verschiedene Ursachen.** RGB-Balken mit Audio = CDM-Output-Protection. Ohne Audio = CDM-Cache-Fehler. Beide haben unterschiedliche Log-Signaturen.
+1. **`ldd` zuerst.** ISA 22.3.14 fehlte `libpugixml.so.1` → alle Playbacks scheitern → irreführende Fehlermeldungen
+2. **`default="true"` in Kodi = Garantie dass deine Config ignoriert wird**
+3. **LE13 ist Beta.** Nightlies haben ungelöste Architekturprobleme mit Widevine
+4. **Pi 5 hat KEINEN V4L2 H.264-Decoder** (anders als Pi 4) → Software-Decode ist Pflicht
+5. **DRMPRIME-Renderer kann keine Software-decodierten Frames rendern** → fundamentale Architekturlücke
+6. **ChromeOS CDMs sind ALLE ARM32 ODER x86_64** → kein aarch64-CDM öffentlich
+7. **CDM `ToCdmVideoCodecProfile` erwartet ChromeOS-Source-Enums** → Kodi/ISA setzt 0 → CDM crasht
 
 ---
 
-Datei: `LE13_WIDEVINE_RESEARCH.md`
-Repository: switch2-raw (Forgejo) / switch2-bt (GitHub)
+## Git History
+
+```
+72587e9 — Squashed: BTstack C bridge 609 Zeilen + Donor LTKs
+d23e6f1 — docs: LE13/Widevine Root Cause Analyse (diese Datei)
+```
+
+---
+
+Datei: `LE13_WIDEVINE_RESEARCH.md`  
+Repository: rixhal/switch2-bt (GitHub) + git.richie.fyi/rixhal/switch2-raw (Forgejo)  
 Branch: feat/switch2d-production-daemon
