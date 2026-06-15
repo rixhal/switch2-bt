@@ -1,22 +1,22 @@
 # SMP Encryption Research — Automated Farming
 
-**Date:** 2026-06-14
-**Session:** 6 (Cron — 6 SearXNG + BTstack source audit + GitHub API)
-**Sessions total:** 6 (04.06 — 14.06.2026)
+**Date:** 2026-06-15
+**Session:** 7 (Cron — 6 SearXNG + GitHub API + sm_pairing_central.c reference harvest)
+**Sessions total:** 7 (04.06 — 15.06.2026)
 **Context:** BTstack BLE daemon on Pi 5 (LibreELEC 13) → Nintendo Switch 2 Pro Controller (E0:EF:BF:3B:C6:76)
 **Blocker:** SMP Encryption doesn't complete → Pair-Commands get `Write Not Permitted (0x03)`
 
 ---
 
-## TL;DR: Sessions 1–4
+## TL;DR: Sessions 1–5
 
-- **Discovery:** Switch 2 Pro Controller uses BLE (not BD/EDR like Switch 1). ND-Adapter works reliably. Direct BLE fails on SMP.
-- **Root cause (Session 3-4):** Controller uses proprietary pseudo-OOB pairing over HID command interface (characteristic 0x0014) — NOT standard SMP. SMP attempts cause disconnect. Leon's Notes + ndeadly docs are the authoritative sources.
-- **CYW43455 known issue:** `le-connection-abort-by-local` on Pi 5's built-in BT. `btstack_chipset_cyw43xx_set_btc_mode(4)` tested. CSR8510 USB dongle as fallback.
-- **Protocol fully documented (Session 4):** Command 0x15 proprietary pairing. Fixed controller key B1 = `5CF6EE792CDF05E1BA2B6325C41A5F10`. LTK = A1 XOR B1. Subcommand 0x04 exchanges keys. Bypass via 0x03/0x07: send BDADDR+LTK directly. ndeadly explicitly states pairing is optional for input reports.
-- **Three-phase strategy established:** Phase A (no security, write unencrypted to 0x0014), Phase B (pre-compute LTK + inject via `sm_register_ltk_callback()` + 0x03/0x07 bypass), Phase C (full 0x15 protocol exchange).
-- **Dead ends confirmed:** Standard SMP (any auth), `sm_set_secure_connections_only_mode()`, donor controller extraction, waiting for `HCI_EVENT_ENCRYPTION_CHANGE`.
-- **SearXNG diagnosis:** Google pattern-selective silence (CamelCase=0, natural=10). Explicit engine strategy (`google,bing,qwant,presearch,duckduckgo,mojeek,braveapi`) established.
+- **Discovery (S1-2):** Switch 2 Pro Controller uses BLE (not BD/EDR like Switch 1). ND-Adapter works. Direct BLE fails on SMP.
+- **Root cause (S3-4):** Proprietary pseudo-OOB pairing over HID command characteristic 0x0014 — NOT standard SMP. SMP attempts cause disconnect. Leon's Notes + ndeadly docs are authoritative.
+- **CYW43455 issue:** `le-connection-abort-by-local` on Pi 5 BT. `btstack_chipset_cyw43xx_set_btc_mode(4)` tested. CSR8510 USB dongle as fallback.
+- **Protocol (S4):** Command 0x15 proprietary pairing. Fixed B1 key = `5CF6EE792CDF05E1BA2B6325C41A5F10`. LTK = A1 XOR B1. Bypass via 0x03/0x07: send BDADDR+LTK directly. ndeadly: pairing optional for input reports.
+- **Three-phase strategy (S4):** Phase A (no security, unencrypted writes to 0x0014), Phase B (pre-compute LTK + inject via `sm_register_ltk_callback()`), Phase C (full 0x15 exchange).
+- **S5 key finding:** `sm_set_request_security(false)` is dead code for central role — gated by `#ifdef ENABLE_LE_PERIPHERAL`. Zero C/BTstack implementations found after 15 queries.
+- **Dead ends confirmed (S1-5):** Standard SMP (any auth), `sm_set_secure_connections_only_mode()`, donor controller extraction, waiting for `HCI_EVENT_ENCRYPTION_CHANGE`.
 
 ---
 
@@ -424,6 +424,162 @@ If 0x0014 rejects unencrypted writes, search ndeadly docs for alternate characte
 
 ---
 
+## Session 7: Freshness Check & Reference Code Harvest — 2026-06-15
+
+### Search Queries (6 SearXNG + GitHub API + Source Fetch)
+
+| # | Provider | Query | Results | Key Hits |
+|---|----------|-------|---------|----------|
+| 1 | SearXNG | btstack gatt characteristic custom pairing inject ltk nintendo controller | 21 (generic) | BTstack manual, DeepWiki GATT Client docs |
+| 2 | SearXNG | switch 2 controller gatt pairing proprietary 0x0014 OR 0x15 | 48 (noise) | Hex literals too generic — Nintendo site, Amazon, PCGamer, Leon's Notes |
+| 3 | SearXNG | btstack sm register ltk callback custom ltk injection example ble | 26 | **sm_register_ltk_callback() sourcevu ref** ⭐, sm.h GitHub source |
+| 4 | SearXNG | site:github.com ndeadly switch2 controller pairing 2026 | 19 | **MissionControl Issue #959** ⭐, ndeadly repos, alexvnesta session docs |
+| 5 | SearXNG | ble XOR fixed key ltk generation public key controller custom pairing | 38 (generic) | Renesas tutorial, BLE security docs, STM32 examples |
+| 6 | SearXNG | btstack skip sm disable no security gatt only connection le peripheral | 33 | **sm_pairing_central.c** ⭐⭐⭐, BTstack manual, GATT Client docs |
+| 7 | GitHub API | ndeadly/switch2_controller_research commits | 10 | **Confirmed: no new commits.** Last still Apr 27, 2026. |
+| 8 | GitHub API | ndeadly/MissionControl Issue #959 comments | 9 | **ndeadly: "All Switch 2 controllers working PoC"** (2025-08-07) ⭐ |
+| 9 | GitHub Raw | bluekitchen/btstack/example/sm_pairing_central.c | 344 lines | **Full central reference code** ⭐⭐⭐⭐⭐ |
+| 10 | GitHub API | alexvnesta/switch2controller commits | 5 | **Confirmed: Switch 1 classic-BT analysis, not Switch 2** |
+| 11 | GitHub API | ndeadly/MissionControl tree (recursive) | — | No Switch2-specific files. BT shim wraps Horizon OS btdrv services. |
+
+### Key Findings
+
+**1. ndeadly Repo Still Stable (49 days without change)**
+
+Confirmed via GitHub API: same 5 commits since Apr 27, 2026. Last commit `d1c5a7f7ba` "More updates for 0x03 commands". Protocol documentation is complete and stable. No breaking changes since Session 4.
+
+**2. MissionControl Issue #959: ndeadly Has Working Switch 2 PoC on Switch Homebrew**
+
+Critical context: ndeadly posted on 2025-08-07:
+> "All Switch 2 controllers are now working as a PoC for both USB and BLE in test builds on my discord server. Still some issues to work through, but inputs are mostly functional."
+
+Key caveats:
+- This runs on **Nintendo Switch hardware** (hacked Switch via Atmosphere CFW), not Linux/BTstack
+- Implementation uses Nintendo's **btdrv service** (Horizon OS Bluetooth stack), not BTstack
+- The source (`btdrv_shim.c`) is a MITM layer intercepting Switch system calls — not applicable to our architecture
+- **No Switch2-specific files exist** in the public MissionControl repo (confirmed by recursive tree search)
+- The shim code (`btdrv_shim.c`, `btdrv_ext.c`, `btm_shim.c`) wraps Horizon OS service calls — no BLE SM, GATT client, or BTstack-like code
+
+**Takeaway:** ndeadly's PoC confirms the controller protocol is implementable, but provides no reference code for our BTstack-on-Linux architecture. The protocol documentation (commands.md, bluetooth_interface.md) remains the authoritative source.
+
+**3. sm_pairing_central.c — Clean Central Reference Code Obtained ✅**
+
+Full source of `bluekitchen/btstack/example/sm_pairing_central.c` (344 lines) harvested from GitHub Raw. This is the official BTstack example for LE Central role with SM pairing. Key patterns for Phase A:
+
+```c
+// Setup (excerpt):
+l2cap_init();
+sm_init();              // Required for SM infrastructure
+att_server_init(...);   // Required even for central (ATT server needed)
+gatt_client_init();     // Required for GATT discovery
+
+// DO NOT call: gatt_client_set_required_security_level(LEVEL_2); — commented out
+// DO NOT call: sm_set_authentication_requirements(...); — all commented out
+// DO NOT call: sm_request_pairing(con_handle); — this IS the trigger for SMP
+
+// On connection complete:
+// Standard example calls sm_request_pairing() — we MUST NOT
+// Instead: directly start GATT discovery
+gatt_client_discover_primary_services(&hci_packet_handler, con_handle);
+```
+
+The `sm_pairing_central.c` pattern confirms our Phase A strategy:
+- `sm_init()` is needed (for internal SM infrastructure/state tracking)
+- `gatt_client_init()` is needed (for GATT client operations)
+- **Neither** security level requirement nor authentication requirements are needed
+- The example calls `sm_request_pairing()` as the explicit trigger — simply don't call it
+- The example comments show `gatt_client_set_required_security_level(LEVEL_2)` is a config option that can be left out
+
+**4. alexvnesta/switch2controller: Misleading Name — Confirmed Switch 1 Classic-BT Analysis**
+
+The repo "switch2controller" is named for **Session 2** (tracking sessions across the project), not Switch 2 hardware. The 2026-04-20 session (`session-2026-04-20-procon.md`) analyzes the **Switch 1 Pro Controller** — triple-confirmed as 100% classic-BT (BR/EDR), no BLE wake advertisements. The repo references ndeadly/switch2_controller_research as "authoritative Switch 2 controller protocol reference." This repo is **not** Switch 2 related and provides no C/BTstack reference code.
+
+**5. Zero C/BTstack Implementations Confirmed (25 queries now)**
+
+After 6 additional queries this session (total across all sessions: 25), still zero C/BTstack embedded implementations for Switch 2 Pro Controller. This is our **7th confirmation** that we are pioneering the first embedded C implementation.
+
+### Dead Ends (Session 7)
+
+| Approach | Status | Evidence |
+|----------|--------|----------|
+| New ndeadly commits | ❌ NONE | Last commit Apr 27, 2026. 49 days without change. |
+| MissionControl BLE source for BTstack patterns | ❌ NOT APPLICABLE | Switch Horizon OS btdrv MITM layer. No BTstack, GATT client, or SM code. |
+| alexvnesta/switch2controller C code | ❌ NOT SWITCH 2 | Switch 1 classic-BT analysis. Not relevant. |
+| Existing C/BTstack impl (25 queries across 7 sessions) | ❌ NONE FOUND | Still pioneering. |
+
+### Phase A Implementation: Updated Reference Pattern
+
+Based on `sm_pairing_central.c` source audit, the confirmed minimal Phase A setup:
+
+```c
+static void switch2_setup(void) {
+    l2cap_init();
+    sm_init();                          // SM infra (needed by BTstack)
+    att_server_init(NULL, NULL, NULL);  // Minimal ATT server
+    gatt_client_init();                 // Needed for GATT discovery/write
+    
+    // NO sm_set_request_security() — dead code for central
+    // NO sm_set_authentication_requirements() — don't set any
+    // NO gatt_client_set_required_security_level() — default = LEVEL_1 (no security)
+    
+    // Register handlers
+    hci_event_callback_registration.callback = &hci_packet_handler;
+    hci_add_event_handler(&hci_event_callback_registration);
+    
+    sm_event_callback_registration.callback = &sm_packet_handler;
+    sm_add_event_handler(&sm_event_callback_registration);
+    
+    // Start scanning
+    gap_set_scan_parameters(1, 0x0030, 0x0030);
+    gap_start_scan();
+}
+
+// In hci_packet_handler, on connection complete:
+case GAP_SUBEVENT_LE_CONNECTION_COMPLETE:
+    con_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
+    // DO NOT call sm_request_pairing(con_handle) — that triggers SMP
+    
+    // DIRECTLY start GATT discovery — no security setup needed
+    gatt_client_discover_primary_services(&hci_packet_handler, con_handle);
+    break;
+```
+
+### Updated Feasibility Ranking (Session 7)
+
+| Rank | Approach | Feasibility | Evidence | Risk |
+|------|----------|-------------|----------|------|
+| **1** | **Phase A: No security** | **VERY HIGH** ✅ | sm_pairing_central.c: no sm_request_pairing() call needed. No security level required. Confirmed by sm.c central flow audit (Session 6). | LOW |
+| **2** | **Phase B: 0x03/0x07 bypass** | **HIGH (if A works)** | 0x0014 writable without encryption — confirmed by ndeadly Python viewer | MEDIUM |
+| **3** | **Phase C: Full 0x15** | **MEDIUM** | Protocol fully documented. Complex state machine. | HIGH |
+
+### Provider Effectiveness
+
+| Provider | Rating | Notes |
+|----------|--------|-------|
+| SearXNG (explicit 7 engines) | ★★★★☆ | 185 results across 6 queries. Found sm_pairing_central.c, MissionControl Issue #959, alexvnesta repo. Google = 10/10 for natural language. |
+| GitHub API | ★★★★★ | ndeadly repo commit freshness confirmed. MissionControl tree search. |
+| GitHub Raw Source | ★★★★★ | sm_pairing_central.c (344 lines) — full reference code harvested. |
+| web_search | Not used | SearXNG provided sufficient coverage. |
+| CommandCode Synthesis | ⛔ CREDITS DEPLETED | Still depleted since Session 5. |
+
+### Next Action (Session 7)
+
+**PRIORITY 1 (IMPLEMENT): Phase A — No-Security Connection**
+
+Implementation reference pattern now fully verified against `sm_pairing_central.c`:
+- Call `sm_init()` + `gatt_client_init()`
+- Do NOT call `sm_request_pairing()`
+- Do NOT set `gatt_client_set_required_security_level()`
+- Start GATT discovery directly on connection complete
+- Write 0x0C/0x00 Feature Select to 0x0014 after GATT query complete
+- Subscribe to input report notifications on 0x000A, 0x000E
+
+**PRIORITY 2: Monitor ndeadly/switch2_controller_research**
+
+No new commits in 49 days. Protocol stable. Set next freshness check to 30 days (2026-07-15).
+
+---
+
 ## Provider Effectiveness
 
 | Provider | Rating | Notes |
@@ -463,3 +619,6 @@ If 0x0014 rejects unencrypted writes, search ndeadly docs for alternate characte
 | 20 | https://github.com/Wilstride/PicoSwitchController | Switch 1 Pro Controller emulation (not S2) | S6 |
 | 21 | https://github.com/bluekitchen/btstack | BTstack main repo | S3 |
 | 22-45 | [See Sessions 1-3 detailed report] | BlueZ, Zephyr, ESP32, Stack Overflow, BT spec | S1-3 |
+| 23 | https://github.com/bluekitchen/btstack/blob/master/example/sm_pairing_central.c | **sm_pairing_central.c — Central role reference code** ⭐⭐⭐⭐⭐ | S7 |
+| 24 | https://github.com/ndeadly/MissionControl/issues/959 | MissionControl Issue #959 — ndeadly Switch 2 PoC (2025-08-07) ⭐ | S7 |
+| 25 | https://github.com/alexvnesta/switch2controller/blob/master/docs/sessions/session-2026-04-20-procon.md | alexvnesta S2026-04-20 — **Switch 1** classic-BT (not S2) | S7 |
